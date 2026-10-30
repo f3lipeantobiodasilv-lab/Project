@@ -3,8 +3,8 @@
 Este repositório contém o projeto de recriação 1:1 do motor de física, renderização e editor de fases (Course Maker) de **Super Mario Maker 2 (SMM2)** rodando nativamente na web via TypeScript e WebGL/Three.js.
 
 > **Regras Absolutas:**
-> 1. ZERO conteúdo procedural. Todos os assets (modelos 3D, texturas, sons) devem ser extraídos da ROM oficial fornecida em `/rom/SMM2.nsp` usando as chaves em `/keys/prod.keys`.
-> 2. O agente deve criar e executar todos os seus próprios scripts de extração/conversão via terminal.
+> 1. ZERO conteúdo procedural. Todos os assets (modelos 3D, texturas, sons) devem ser extraídos do pacote de dados de laboratório fornecido via link externo (`https://pixeldrain.com/api/file/vXK1wWuM`).
+> 2. O agente deve criar e executar todos os seus próprios scripts de extração/conversão via terminal na pasta `/tmp`.
 > 3. O desenvolvimento deve seguir estritamente a execução ordenada por **Fases**.
 
 ---
@@ -12,17 +12,17 @@ Este repositório contém o projeto de recriação 1:1 do motor de física, rend
 ## Roadmap de Execução (Fases)
 
 ### Módulo 1: Extração e Automação de Assets (Terminal)
-- [ ] **Fase 1: Extração do RomFS**
-  - Baixar/configurar ferramentas CLI de terminal (como `hactoolnet`).
-  - Descriptografar `/rom/SMM2.nsp` com `/keys/prod.keys` e extrair a partição `RomFS`.
-- [ ] **Fase 2: Descompressão Yaz0**
-  - Escrever script Python para varrer e descompactar arquivos `.szs`.
-- [ ] **Fase 3: Conversão de Texturas**
-  - Escrever script para converter arquivos `.bntx` em PNGs com canal alfa limpo em `/src/assets/textures/`.
-- [ ] **Fase 4: Conversão de Modelos 3D**
-  - Escrever script para converter modelos e animações `.bfres` em `.glb` (glTF) em `/src/assets/models/`.
+- [ ] **Fase 1: Download e Setup do Workspace**
+  - Fazer o download do pacote de assets comprimidos via terminal usando o link Pixeldrain fornecido (`https://pixeldrain.com/api/file/vXK1wWuM`).
+  - Configurar e estruturar a pasta `/tmp` para os scripts de conversão temporários.
+- [ ] **Fase 2: Descompressão de Contêineres (Yaz0 / SZS)**
+  - Escrever script Python para varrer e descompactar arquivos de pacotes compactados.
+- [ ] **Fase 3: Conversor de Superfícies Gráficas (BNTX)**
+  - Escrever script para converter dados de texturas em imagens PNG limpas com canal alfa em `/src/assets/textures/`.
+- [ ] **Fase 4: Conversor de Malhas 3D (BFRES)**
+  - Escrever script para converter modelos e esqueletos tridimensionais para o formato aberto glTF/GLB em `/src/assets/models/`.
 - [ ] **Fase 5: Processamento de Áudio**
-  - Extrair e converter bancos de áudio `.bfsar` em `.wav`/`.ogg` em `/src/assets/audio/`.
+  - Extrair e converter os streams de áudio dos bancos de dados binários em arquivos `.wav`/`.ogg` em `/src/assets/audio/`.
 
 ---
 
