@@ -374,6 +374,41 @@ float ambientOcclusion(vec2 uv, float depth) {
   return 1.0 - occ * 0.075 * uLighting.y;
 }
 
+// --- Screen-Space Sun Occlusion -------------------------------------------
+// Passo A/B: neste projeto uSun.xy já é a posição do sol em UV de tela
+// (0..1, mesmo espaço de vUv/tDepth) — não há matriz de projeção a aplicar.
+// O RT_Depth (tDepth) NÃO é um depth buffer 0..1 de câmera: é a camada 2D
+// do G-Buffer, onde o céu escreve exatamente 1.0 e todo sólido escreve
+// <= 0.86 (serras; terreno 0.48, nave 0.16...). Por isso a referência do
+// sol é sunDepth = 1.0 e o smoothstep usa a faixa 0.96..0.99 já usada
+// neste shader para separar céu (depth > 0.96) de geometria.
+float sunOcclusionTap(vec2 sunUV) {
+  float occlusionDepth = texture(tDepth, sunUV).r;
+  float sunDepth = 1.0;
+  return smoothstep(sunDepth - 0.04, sunDepth - 0.01, occlusionDepth);
+}
+
+float computeSunVisibility() {
+  vec2 sunUV = clamp(uSun.xy, vec2(0.002), vec2(0.998));
+  // Amostrar só o pixel central viraria um degrau seco: neste RT os
+  // valores saltam de 1.0 (céu) para 0.86 (serra) sem valores entre eles,
+  // então o smoothstep de profundidade sozinho não suaviza nada. Em vez
+  // disso amostramos a *pegada do disco solar* (raio 0.012 na métrica
+  // corrigida por aspecto do geometry pass): a fração de taps que ainda
+  // enxerga céu é a visibilidade — oclusão parcial = fade suave quando
+  // o sol desliza para trás do relevo.
+  float discRadius = 0.012;
+  vec2 ringRadius = vec2(discRadius / max(uSun.w, 0.001), discRadius);
+  float visibility = sunOcclusionTap(sunUV) * 0.20;
+  for (int i = 0; i < 8; i++) {
+    float angle = 6.2831853 * (float(i) / 8.0);
+    vec2 ringOffset = vec2(cos(angle) * ringRadius.x, sin(angle) * ringRadius.y);
+    visibility += sunOcclusionTap(sunUV + ringOffset) * 0.075;
+    visibility += sunOcclusionTap(sunUV + ringOffset * 0.5) * 0.025;
+  }
+  return clamp(visibility, 0.0, 1.0);
+}
+
 float cloudField(vec2 p, float slice) {
   float time = uResolutionTime.z;
   vec2 wind = vec2(time * 0.011, -time * 0.002) * uAtmosphere.z;
@@ -431,7 +466,7 @@ float fogDensity(vec2 p) {
   return (wisps * lowAltitude * 1.75 + 0.018) * uAtmosphere.x;
 }
 
-vec4 integrateFog(vec2 uv, vec2 lightDir, float sunDistance, float jitter) {
+vec4 integrateFog(vec2 uv, vec2 lightDir, float sunDistance, float jitter, float sunVisibility) {
   // B — o scattering acumulado é atenuado pelo ciclo: à noite o
   // Rayleigh/Mie solar zera e resta só um resíduo de luar azul-marinho.
   float fogDayFactor = sunDayFactor();
@@ -453,8 +488,10 @@ vec4 integrateFog(vec2 uv, vec2 lightDir, float sunDistance, float jitter) {
     float attenuation = exp(-1.35 * t);
     vec3 dayFogTint = mix(vec3(0.34, 0.105, 0.055), vec3(0.12, 0.21, 0.38), smoothstep(0.15, 0.75, p.y));
     vec3 fogTint = mix(vec3(0.006, 0.010, 0.024), dayFogTint, fogDayFactor);
-    // À noite a fase perde o forward-scattering solar (o "brilho" Mie).
-    float phase = mix(0.05, 0.48 + exp(-sunDistance * 3.5) * 1.35, fogDayFactor);
+    // À noite a fase perde o forward-scattering solar (o "brilho" Mie) —
+    // e ele também some quando o sol está ocluído pelo relevo: sem disco
+    // visível, não há fonte para o halo volumétrico em torno dele.
+    float phase = mix(0.05, 0.48 + exp(-sunDistance * 3.5) * 1.35 * sunVisibility, fogDayFactor);
     scattering += transmittance * (1.0 - extinction) * fogTint * attenuation * phase * fogIrradiance;
     transmittance *= extinction;
     t += interval;
@@ -560,6 +597,14 @@ void main() {
   float sunElevation = computeSunElevation();
   float dayFactor = smoothstep(-0.15, 0.05, sunElevation);
   float directFactor = smoothstep(0.0, 0.08, sunElevation);
+  // Oclusão screen-space do sol (17 taps na pegada do disco, calculada
+  // 1× por pixel e reutilizada por fog e glow — e NÃO pela radiância
+  // direta, que já tem sombra por-pixel via screenShadow: multiplicar a
+  // cena inteira por um único sample faria tudo piscar quando o centro
+  // do sol cruza uma silhueta). Só é amostrada se o passe volumétrico —
+  // o único consumidor — estiver ativo.
+  float sunVisibility = 1.0;
+  if (uFlags.y > 0.5 && uAtmosphere.x > 0.001) sunVisibility = computeSunVisibility();
 
   if (depth > 0.96) {
     // O albedo do céu já chega com o mix dia/noite e o disco solar com
@@ -600,13 +645,22 @@ void main() {
   }
 
   if (uFlags.y > 0.5 && uAtmosphere.x > 0.001) {
-    vec4 fog = integrateFog(uv, lightDir, sunDistance, jitter);
+    vec4 fog = integrateFog(uv, lightDir, sunDistance, jitter, sunVisibility);
     color *= 1.0 - fog.a * 0.4;
     color += fog.rgb;
     float outerGlow = exp(-sunDistance * 5.5) * uAtmosphere.x;
     float innerGlow = exp(-sunDistance * 15.0) * uAtmosphere.x;
-    color += vec3(0.055, 0.105, 0.23) * outerGlow * (uSun.z * dayFactor) * 0.34;
-    color += vec3(0.55, 0.24, 0.09) * innerGlow * (uSun.z * dayFactor) * 0.24;
+    // Passo B/5 — glow solar: este termo é aditivo e era somado a TODOS
+    // os pixels (inclusive ao terreno/nave à frente do sol) — é ele que
+    // vazava por cima das montanhas. Agora é atenuado pela visibilidade.
+    // O bloom do COMPOSITE_FRAGMENT é genérico (threshold sobre tColor)
+    // e não sabe distinguir sol de lâmpada; ele não é tocado — sem fonte
+    // solar no lighting target, não há o que ele espalhar, e o bloom dos
+    // emissivos (nave/janelas) continua intacto à noite.
+    vec3 rawSunGlow = vec3(0.055, 0.105, 0.23) * outerGlow * (uSun.z * dayFactor) * 0.34
+                    + vec3(0.55, 0.24, 0.09) * innerGlow * (uSun.z * dayFactor) * 0.24;
+    vec3 finalSunGlow = rawSunGlow * sunVisibility;
+    color += finalSunGlow;
   }
 
   // C — emissivo por último: naves, lâmpadas e janelas seguem brilhando

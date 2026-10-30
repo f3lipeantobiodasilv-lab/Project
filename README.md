@@ -67,6 +67,7 @@ Todos os objetos compartilham um quad instanciado e um único draw call. SDFs no
 ### Pass 2 — Lighting / volumes
 
 - **Ciclo dia/noite:** `SUN_CYCLE` (em `shaders.js`) deriva `sunElevation` de `uSun.y` relativo ao horizonte (`0.245`), `dayFactor = smoothstep(-0.15, 0.05, sunElevation)` para céu/fog/nuvens/ambiente e `directFactor = smoothstep(0.0, 0.08, sunElevation)` para a luz direta e o SSR — ambos chegam a zero à noite. O emissivo do G-Buffer é somado só depois de nuvens e fog, então luzes artificiais não apagam com o sol.
+- **Oclusão do sol (screen-space):** `computeSunVisibility()` amostra a pegada do disco solar (17 taps) no RT de depth do G-Buffer — céu = `1.0`, sólidos ≤ `0.86` — e a fração visível atenua o glow aditivo do fog e o forward-scattering Mie. A radiância direta não usa esse fator (ela já tem sombra por-pixel via shadow march), e o bloom genérico do composite não é tocado: sem fonte solar no lighting target, não há bloom solar para espalhar, e o bloom dos emissivos permanece. Nuvens são procedurais no lighting pass e não escrevem no G-Buffer, portanto não ocluem o sol nesse teste.
 - **PBR:** GGX + Smith–Schlick + Fresnel de Schlick em um Cook–Torrance simplificado.
 - **SSR:** reflexão calculada da normal 2D, march linear, quatro iterações de refinamento binário, blur proporcional à rugosidade e fade nas bordas.
 - **Fog:** raymarch com jitter espacial/temporal, densidade fBm, atenuação exponencial e early exit por transmitância.
