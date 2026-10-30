@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#090c10">
+  <meta name="description" content="AETHER 2D — engine WebGL2 com raymarching volumétrico, PBR, SSR e denoising em tempo real.">
+  <title>AETHER 2D — Atmospheric Rendering Engine</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <svg class="svg-defs" aria-hidden="true">
+    <defs>
+      <symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></symbol>
+      <symbol id="i-pause" viewBox="0 0 24 24"><path d="M8 5v14M16 5v14"/></symbol>
+      <symbol id="i-reset" viewBox="0 0 24 24"><path d="M4 4v6h6M5.5 15a7 7 0 1 0 .5-7.8L4 10"/></symbol>
+      <symbol id="i-expand" viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/></symbol>
+      <symbol id="i-pipeline" viewBox="0 0 24 24"><rect x="3" y="3" width="6" height="6" rx="1"/><rect x="15" y="15" width="6" height="6" rx="1"/><path d="M9 6h5a4 4 0 0 1 4 4v5M6 9v5a4 4 0 0 0 4 4h5"/></symbol>
+      <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M19.1 4.9l-1.4 1.4M6.3 17.7l-1.4 1.4"/></symbol>
+      <symbol id="i-chevron" viewBox="0 0 24 24"><path d="m9 6 6 6-6 6"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+      <symbol id="i-mouse" viewBox="0 0 24 24"><rect x="7" y="2" width="10" height="20" rx="5"/><path d="M12 6v4"/></symbol>
+      <symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    </defs>
+  </svg>
+
+  <header class="app-header">
+    <a class="brand" href="./" aria-label="AETHER 2D — início">
+      <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span class="brand-name">AETHER<span>/2D</span></span>
+    </a>
+    <div class="header-divider"></div>
+    <div class="project-name">
+      <span>ATMOSPHERIC RENDERING ENGINE</span>
+      <small>Research build · v1.0.0</small>
+    </div>
+    <div class="header-actions">
+      <button class="text-button" id="architectureButton" type="button">
+        <svg><use href="#i-pipeline"/></svg>
+        Arquitetura
+      </button>
+      <span class="api-badge"><i></i> WebGL2</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="viewport-column" aria-label="Viewport da engine">
+      <div class="viewport-toolbar">
+        <div class="mission-title">
+          <span class="eyebrow">SCENE 01</span>
+          <h1>Elysium Planitia</h1>
+          <span class="mission-tag">SOL 184</span>
+        </div>
+        <div class="view-modes" role="group" aria-label="Visualização do framebuffer">
+          <button class="view-mode active" data-view="0" type="button">Final</button>
+          <button class="view-mode" data-view="1" type="button">Albedo</button>
+          <button class="view-mode" data-view="2" type="button">Normais</button>
+          <button class="view-mode" data-view="3" type="button">Depth</button>
+        </div>
+      </div>
+
+      <div class="canvas-shell" id="canvasShell">
+        <canvas id="glCanvas" aria-label="Cena procedural de Marte renderizada com WebGL2"></canvas>
+        <div class="canvas-top-overlay">
+          <div class="live-status"><i></i><span id="liveLabel">LIVE RENDER</span></div>
+          <div class="scene-coordinates">18.42°N&nbsp;&nbsp; 77.52°E</div>
+        </div>
+        <div class="reticle" aria-hidden="true"><i></i><i></i></div>
+        <div class="sun-hint" id="sunHint"><span></span> SOL / FONT 01</div>
+        <div class="canvas-bottom-overlay">
+          <div class="interaction-hint">
+            <svg><use href="#i-mouse"/></svg>
+            <span>Arraste na cena para reposicionar o sol</span>
+          </div>
+          <div class="viewport-actions">
+            <button class="icon-button" id="resetButton" type="button" title="Restaurar cena (R)" aria-label="Restaurar cena">
+              <svg><use href="#i-reset"/></svg>
+            </button>
+            <button class="icon-button" id="fullscreenButton" type="button" title="Tela cheia" aria-label="Tela cheia">
+              <svg><use href="#i-expand"/></svg>
+            </button>
+          </div>
+        </div>
+        <div class="boot-screen" id="bootScreen">
+          <div class="boot-loader"><i></i><i></i><i></i></div>
+          <span>COMPILANDO PIPELINE</span>
+          <small>MRT · VOLUMETRICS · SSR · DENOISE</small>
+        </div>
+        <div class="error-screen" id="errorScreen" hidden>
+          <strong>WebGL2 não disponível</strong>
+          <p id="errorMessage">Esta demo precisa de um navegador com WebGL2 habilitado.</p>
+        </div>
+      </div>
+
+      <div class="pipeline-strip" aria-label="Pipeline de renderização">
+        <div class="pipeline-node active"><span>01</span><div><strong>G-BUFFER</strong><small>3 × MRT · native</small></div></div>
+        <svg><use href="#i-chevron"/></svg>
+        <div class="pipeline-node"><span>02</span><div><strong>LIGHTING</strong><small>PBR · SSR · volumes</small></div></div>
+        <svg><use href="#i-chevron"/></svg>
+        <div class="pipeline-node" id="denoiseNode"><span>03</span><div><strong>DENOISE</strong><small>edge-aware · 5 × 5</small></div></div>
+        <svg><use href="#i-chevron"/></svg>
+        <div class="pipeline-node"><span>04</span><div><strong>COMPOSITE</strong><small>ACES · upscale</small></div></div>
+      </div>
+
+      <div class="telemetry-bar">
+        <div class="telemetry-primary">
+          <span class="fps-value" id="fpsValue">—</span>
+          <span class="fps-unit">FPS<small id="frameTime">— ms / frame</small></span>
+        </div>
+        <canvas id="performanceGraph" width="240" height="42" aria-label="Histórico de FPS"></canvas>
+        <div class="telemetry-item"><span>INTERNAL</span><strong id="internalResolution">— × —</strong></div>
+        <div class="telemetry-item"><span>DRAW CALLS</span><strong id="drawCalls">4 / frame</strong></div>
+        <div class="telemetry-item hide-narrow"><span>RENDERER</span><strong id="rendererName">Detecting GPU</strong></div>
+      </div>
+    </section>
+
+    <aside class="control-panel" aria-label="Controles da engine">
+      <div class="panel-heading">
+        <div><span class="eyebrow">REAL-TIME PARAMETERS</span><h2>Controle de cena</h2></div>
+        <button class="play-button" id="playButton" type="button" aria-label="Pausar simulação" title="Pausar (Espaço)">
+          <svg><use href="#i-pause"/></svg>
+        </button>
+      </div>
+
+      <div class="panel-scroll">
+        <section class="control-section">
+          <div class="section-heading"><span>01</span><h3>Atmosfera</h3><small>RAYMARCH</small></div>
+          <label class="slider-control" for="fogDensity">
+            <span>Densidade da névoa <output id="fogDensityValue">0.65</output></span>
+            <input id="fogDensity" type="range" min="0" max="1.5" value="0.65" step="0.01">
+            <span class="range-labels"><small>VACUUM</small><small>DENSE</small></span>
+          </label>
+          <label class="slider-control" for="cloudCoverage">
+            <span>Cobertura de nuvens <output id="cloudCoverageValue">0.48</output></span>
+            <input id="cloudCoverage" type="range" min="0" max="1" value="0.48" step="0.01">
+          </label>
+          <label class="slider-control" for="sunIntensity">
+            <span>Intensidade solar <output id="sunIntensityValue">2.40</output></span>
+            <input id="sunIntensity" type="range" min="0.2" max="5" value="2.4" step="0.05">
+          </label>
+          <label class="slider-control" for="windSpeed">
+            <span>Velocidade do vento <output id="windSpeedValue">0.55</output></span>
+            <input id="windSpeed" type="range" min="0" max="2" value="0.55" step="0.01">
+          </label>
+        </section>
+
+        <section class="control-section">
+          <div class="section-heading"><span>02</span><h3>Iluminação</h3><small>PBR / SSR</small></div>
+          <label class="slider-control" for="ssrIntensity">
+            <span>Intensidade dos reflexos <output id="ssrIntensityValue">0.75</output></span>
+            <input id="ssrIntensity" type="range" min="0" max="1.5" value="0.75" step="0.01">
+          </label>
+          <label class="slider-control" for="exposure">
+            <span>Exposição <output id="exposureValue">1.05</output></span>
+            <input id="exposure" type="range" min="0.4" max="2" value="1.05" step="0.01">
+          </label>
+          <div class="toggle-list">
+            <label class="toggle-row" for="ssrEnabled"><span><strong>Screen-space reflections</strong><small>Linear march + binary refine</small></span><input id="ssrEnabled" type="checkbox" checked><i></i></label>
+            <label class="toggle-row" for="volumesEnabled"><span><strong>Névoa volumétrica</strong><small>Jittered interval raymarch</small></span><input id="volumesEnabled" type="checkbox" checked><i></i></label>
+            <label class="toggle-row" for="cloudsEnabled"><span><strong>Nuvens procedurais</strong><small>Self-shadow + ground projection</small></span><input id="cloudsEnabled" type="checkbox" checked><i></i></label>
+          </div>
+        </section>
+
+        <section class="control-section quality-section">
+          <div class="section-heading"><span>03</span><h3>Performance</h3><small>ADAPTIVE</small></div>
+          <div class="quality-presets" role="group" aria-label="Preset de qualidade">
+            <button data-quality="performance" type="button">Performance</button>
+            <button data-quality="balanced" class="active" type="button">Balanceado</button>
+            <button data-quality="ultra" type="button">Ultra</button>
+          </div>
+          <label class="slider-control" for="renderScale">
+            <span>Resolução interna <output id="renderScaleValue">65%</output></span>
+            <input id="renderScale" type="range" min="40" max="100" value="65" step="5">
+          </label>
+          <label class="toggle-row standalone" for="denoiseEnabled"><span><strong>Denoiser bilateral</strong><small>Normal + depth guided</small></span><input id="denoiseEnabled" type="checkbox" checked><i></i></label>
+          <label class="toggle-row standalone" for="adaptiveEnabled"><span><strong>Resolução adaptativa</strong><small>Mantém o alvo de 60 FPS</small></span><input id="adaptiveEnabled" type="checkbox"><i></i></label>
+          <div class="budget-card">
+            <div><span>FRAME BUDGET</span><strong>16.7 ms</strong></div>
+            <div class="budget-track"><i id="budgetFill"></i></div>
+            <small id="qualitySummary">20 ray steps · 5 cloud slices · 12 SSR steps</small>
+          </div>
+        </section>
+      </div>
+
+      <footer class="panel-footer">
+        <span><i></i><b id="instanceCount">—</b> INSTANCES / 1 BATCH</span>
+        <span>UBO · BINDING 0</span>
+      </footer>
+    </aside>
+  </main>
+
+  <footer class="app-footer">
+    <span>AETHER CORE <b>·</b> ZERO-ALLOCATION RENDER LOOP</span>
+    <span><kbd>SPACE</kbd> PAUSE <kbd>R</kbd> RESET <kbd>1—4</kbd> DEBUG VIEW</span>
+  </footer>
+
+  <dialog id="architectureDialog" class="architecture-dialog">
+    <div class="dialog-heading">
+      <div><span class="eyebrow">UNDER THE HOOD</span><h2>Pipeline orientado a screen-space</h2></div>
+      <button class="icon-button" id="closeDialog" type="button" aria-label="Fechar"><svg><use href="#i-close"/></svg></button>
+    </div>
+    <p class="dialog-intro">Um renderer 2.5D deliberadamente explícito: geometria em resolução nativa e os passes caros em resolução interna ajustável.</p>
+    <div class="architecture-grid">
+      <article><span>PASS 01</span><h3>G-Buffer / MRT</h3><p>Um único batch instanciado escreve albedo + emissão, normais + rugosidade + metalicidade e profundidade linear.</p><code>RGBA8 · RGBA16F · RGBA16F</code></article>
+      <article><span>PASS 02</span><h3>Lighting / Volumes</h3><p>Cook–Torrance simplificado, shadow march, SSR com refinamento binário, névoa fBm e nuvens com self-shadowing.</p><code>RGBA16F · dynamic resolution</code></article>
+      <article><span>PASS 03</span><h3>Guided Denoise</h3><p>Kernel 5×5 com pesos espaciais, similaridade de profundidade e alinhamento de normais para preservar as bordas.</p><code>25 taps · edge-aware</code></article>
+      <article><span>PASS 04</span><h3>Composite</h3><p>Upsampling, bloom sutil, tone mapping ACES, correção gama, vinheta e views de diagnóstico do G-Buffer.</p><code>Native resolution · canvas</code></article>
+    </div>
+    <div class="architecture-note"><strong>Nota de engenharia</strong><p>SSR 2D só pode reutilizar informação já visível no G-Buffer; o denoiser é espacial, sem histórico temporal. São escolhas que evitam ghosting e mantêm o custo previsível.</p></div>
+    <div class="dialog-footer"><span>Sem dependências · WebGL2 / GLSL ES 3.00</span><a href="./README.md" target="_blank" rel="noreferrer">Abrir documentação ↗</a></div>
+  </dialog>
+
+  <script type="module" src="./src/main.js"></script>
+</body>
+</html>

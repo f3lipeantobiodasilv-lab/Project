@@ -1,0 +1,12 @@
+{
+  "name": "aether-2d-engine",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Engine gráfica 2D WebGL2 com MRT, raymarching volumétrico, PBR, SSR e denoising.",
+  "scripts": {
+    "dev": "node server.mjs",
+    "start": "node server.mjs",
+    "check": "node --check src/main.js && node --check src/engine.js && node --check src/gl.js && node --check src/scene.js && node --check src/shaders.js && node --check server.mjs"
+  }
+}
