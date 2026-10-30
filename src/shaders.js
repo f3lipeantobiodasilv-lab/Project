@@ -6,6 +6,8 @@ layout(std140) uniform Globals {
   vec4 uLighting;       // SSR, AO, bloom, debug view
   vec4 uQuality;        // fog steps, cloud slices, render scale, SSR steps
   vec4 uFlags;          // SSR, fog, clouds, denoise
+  vec4 uPost;           // bloom threshold, bloom knee, god-ray intensity, chromatic aberration
+  vec4 uPost2;          // auto-exposure on/off, god-ray steps, dust intensity, bloom on/off
 };
 `;
 
@@ -150,6 +152,9 @@ void main() {
   float metallic = vMaterial.y;
   float emission = vMaterial.z;
   float depth = vParams.z;
+  // LOD vindo do SpatialGrid (codificado em vColor.a = 1 + lod pela
+  // SceneBatch): 0 perto/grande, 2 distante/pequeno.
+  float lodLevel = clamp(vColor.a - 1.0, 0.0, 2.0);
 
   if (type < 0.5) {
     float y = vWorld.y;
@@ -207,7 +212,7 @@ void main() {
     color = mix(vec3(0.115, 0.045, 0.026), vColor.rgb, 0.48 + grit * 0.52);
     color *= 0.76 + strata * 0.14;
     color += vec3(0.11, 0.047, 0.018) * smoothstep(height - 0.045, height, vWorld.y);
-    float pebble = step(0.985, hash12(floor(vWorld * vec2(560.0, 330.0))));
+    float pebble = lodLevel < 1.5 ? step(0.985, hash12(floor(vWorld * vec2(560.0, 330.0)))) : 0.0;
     color += pebble * vec3(0.12, 0.08, 0.05);
     normal = normalize(vec2(-derivative * 0.3 + (grit - 0.5) * 0.34, 1.0));
     roughness = 0.88;
@@ -219,7 +224,8 @@ void main() {
     float distanceToEdge = length(p) - edge;
     if (distanceToEdge > 0.0) discard;
     float rockNoise = fbm2(vUv * 7.0 + vParams.y);
-    color = vColor.rgb * (0.64 + rockNoise * 0.65);
+    // Em LOD 2 o micro-detalhe vira aliasing: achata o contraste do fBm.
+    color = vColor.rgb * (0.64 + rockNoise * mix(0.65, 0.30, lodLevel * 0.5));
     color *= 0.84 + max(p.y, 0.0) * 0.18;
     normal = normalize(p * 0.72 + vec2((rockNoise - 0.5) * 0.3, 0.55));
     roughness = 0.84;
@@ -313,6 +319,11 @@ ${SUN_CYCLE}
 uniform sampler2D tAlbedo;
 uniform sampler2D tNormalMaterial;
 uniform sampler2D tDepth;
+// Luzes pontuais dinâmicas (Pillar 2): A = pos xy, altura z, raio;
+// B = cor rgb, intensidade. Preenchido por DynamicLightBank.
+uniform vec4 uPointLightsA[4];
+uniform vec4 uPointLightsB[4];
+uniform float uPointLightGlobal;
 layout(location = 0) out vec4 outColor;
 const float PI = 3.14159265359;
 
@@ -577,6 +588,44 @@ vec3 cookTorrance(vec3 baseColor, vec3 N, vec3 L, vec3 V, float roughness, float
   return (diffuse + specular) * radiance * NdotL;
 }
 
+// Oclusão de uma luz pontual: marcha curta pixel→luz sobre o RT_Depth.
+// Camadas mais próximas da câmera (depth menor) entre o pixel e a luz
+// bloqueiam a contribuição — é o mesmo princípio do screenShadow solar,
+// mas radial e por luz.
+float pointLightOcclusion(vec2 uv, float depth, vec2 lightUv) {
+  float occlusion = 0.0;
+  for (int i = 1; i <= 6; i++) {
+    float t = float(i) / 7.0;
+    vec2 p = mix(uv, lightUv, t);
+    float sampleDepth = texture(tDepth, p).r;
+    if (sampleDepth < depth - 0.045 && sampleDepth < 0.96) occlusion += 0.45;
+  }
+  return clamp(1.0 - occlusion, 0.12, 1.0);
+}
+
+vec3 evaluatePointLights(vec3 baseColor, vec3 N, vec3 V, float roughness, float metallic, float depth, vec2 uv) {
+  if (uPointLightGlobal <= 0.001) return vec3(0.0);
+  vec3 total = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    vec4 lightA = uPointLightsA[i];
+    vec4 lightB = uPointLightsB[i];
+    if (lightB.a <= 0.001 || lightA.w <= 0.001) continue;
+    vec3 delta = vec3((lightA.x - uv.x) * uSun.w, lightA.y - uv.y, lightA.z);
+    float distanceToLight = length(delta);
+    if (distanceToLight >= lightA.w) continue;
+    vec3 L = delta / max(distanceToLight, 0.0001);
+    // Atenuação física (inverso do quadrado suavizado) × cutoff suave:
+    //   1 / (1 + c1·d + c2·d²) · (1 − (d/radius)⁴)²
+    float cutoffRatio = distanceToLight / lightA.w;
+    float cutoff = max(0.0, 1.0 - cutoffRatio * cutoffRatio * cutoffRatio * cutoffRatio);
+    float attenuation = (1.0 / (1.0 + 0.9 * distanceToLight + 6.0 * distanceToLight * distanceToLight)) * cutoff * cutoff;
+    float occlusion = pointLightOcclusion(uv, depth, lightA.xy);
+    vec3 radiance = lightB.rgb * (lightB.a * uPointLightGlobal * attenuation * occlusion);
+    total += cookTorrance(baseColor, N, L, V, roughness, metallic, radiance);
+  }
+  return total;
+}
+
 void main() {
   vec2 uv = vUv;
   vec4 albedo = texture(tAlbedo, uv);
@@ -619,6 +668,9 @@ void main() {
     // Luz direta + especular Cook–Torrance zeram abaixo do horizonte.
     vec3 radiance = sunColor * (uSun.z * directFactor) * shadow / (0.9 + sunDistance * 0.25);
     color = cookTorrance(albedo.rgb, N, L, V, material.b, material.a, radiance);
+    // Luzes pontuais (farol, exaustão, beacon, work light) — independentes
+    // do ciclo solar: é o que ilumina a cena à noite junto dos emissivos.
+    color += evaluatePointLights(albedo.rgb, N, V, material.b, material.a, depth, uv);
     float ao = ambientOcclusion(uv, depth);
     float skyFacing = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
     vec3 dayAmbient = mix(vec3(0.055, 0.035, 0.04), vec3(0.09, 0.12, 0.19), skyFacing);
@@ -720,6 +772,266 @@ void main() {
 }
 `;
 
+export const COPY_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tColor;
+layout(location = 0) out vec4 outColor;
+void main() {
+  outColor = texture(tColor, vUv);
+}
+`;
+
+export const LUMINANCE_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tColor;
+uniform vec2 uTexel;
+uniform float uLogInput;
+layout(location = 0) out vec4 outColor;
+float luminance(vec3 color) {
+  return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+float sampleLogLuminance(vec2 uv) {
+  vec4 value = texture(tColor, uv);
+  if (uLogInput > 0.5) return value.r;
+  return log(max(luminance(value.rgb), 0.0001));
+}
+void main() {
+  // Média em espaço log: média geométrica da luminância, robusta a
+  // highlights (sol/emissivos) — base da auto-exposição.
+  float sum = sampleLogLuminance(vUv + uTexel * vec2(-0.5, -0.5));
+  sum += sampleLogLuminance(vUv + uTexel * vec2(0.5, -0.5));
+  sum += sampleLogLuminance(vUv + uTexel * vec2(-0.5, 0.5));
+  sum += sampleLogLuminance(vUv + uTexel * vec2(0.5, 0.5));
+  outColor = vec4(vec3(sum * 0.25), 1.0);
+}
+`;
+
+export const ADAPT_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tAverage;
+uniform sampler2D tPrevious;
+uniform vec4 uAdaptParams; // dt, speed, min exposure, max exposure
+layout(location = 0) out vec4 outColor;
+void main() {
+  float averageLuminance = exp(texture(tAverage, vec2(0.5)).r);
+  float targetExposure = clamp(0.34 / max(averageLuminance, 0.0001), uAdaptParams.z, uAdaptParams.w);
+  float previousExposure = texture(tPrevious, vec2(0.5)).r;
+  // Eye adaptation: Exposure_new = old + (target − old)·(1 − e^(−dt·speed))
+  float adapted = previousExposure + (targetExposure - previousExposure) * (1.0 - exp(-uAdaptParams.x * uAdaptParams.y));
+  outColor = vec4(clamp(adapted, uAdaptParams.z, uAdaptParams.w), averageLuminance, targetExposure, 1.0);
+}
+`;
+
+export const BLOOM_PREFILTER_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+${GLOBALS}
+uniform sampler2D tColor;
+layout(location = 0) out vec4 outColor;
+float luminance(vec3 color) {
+  return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+void main() {
+  vec3 color = texture(tColor, vUv).rgb;
+  float luma = luminance(color);
+  float threshold = uPost.x;
+  float knee = max(uPost.y, 0.001);
+  // High-pass com joelho suave: nada abaixo do threshold, rampa orgânica acima.
+  float soft = clamp((luma - threshold + knee) / (2.0 * knee), 0.0, 1.0);
+  soft *= soft;
+  float contribution = clamp((luma - threshold) / max(luma, 0.0001), 0.0, 1.0);
+  outColor = vec4(color * max(soft * contribution, 0.0), 1.0);
+}
+`;
+
+export const KAWASE_DOWNSAMPLE_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tColor;
+uniform vec2 uTexel;
+layout(location = 0) out vec4 outColor;
+void main() {
+  vec2 offset = uTexel * 1.5;
+  vec3 color = texture(tColor, vUv + vec2(-offset.x, -offset.y)).rgb;
+  color += texture(tColor, vUv + vec2(offset.x, -offset.y)).rgb;
+  color += texture(tColor, vUv + vec2(-offset.x, offset.y)).rgb;
+  color += texture(tColor, vUv + vec2(offset.x, offset.y)).rgb;
+  outColor = vec4(color * 0.25, 1.0);
+}
+`;
+
+export const KAWASE_UPSAMPLE_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tColor;
+uniform vec2 uTexel;
+uniform float uRadius;
+layout(location = 0) out vec4 outColor;
+void main() {
+  vec2 o = uTexel * uRadius;
+  vec3 color = texture(tColor, vUv + vec2(-o.x, 0.0)).rgb * 2.0;
+  color += texture(tColor, vUv + vec2(o.x, 0.0)).rgb * 2.0;
+  color += texture(tColor, vUv + vec2(0.0, -o.y)).rgb * 2.0;
+  color += texture(tColor, vUv + vec2(0.0, o.y)).rgb * 2.0;
+  color += texture(tColor, vUv + vec2(-o.x, -o.y)).rgb;
+  color += texture(tColor, vUv + vec2(o.x, -o.y)).rgb;
+  color += texture(tColor, vUv + vec2(-o.x, o.y)).rgb;
+  color += texture(tColor, vUv + vec2(o.x, o.y)).rgb;
+  outColor = vec4(color * (1.0 / 12.0), 1.0);
+}
+`;
+
+export const GODRAYS_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+${GLOBALS}
+${SUN_CYCLE}
+uniform sampler2D tColor;
+uniform sampler2D tDepth;
+layout(location = 0) out vec4 outColor;
+float luminance(vec3 color) {
+  return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+void main() {
+  vec2 sunUV = clamp(uSun.xy, vec2(0.0), vec2(1.0));
+  int steps = clamp(int(uPost2.y + 0.5), 1, 48);
+  vec2 delta = (sunUV - vUv) / float(steps);
+  vec2 sampleUv = vUv;
+  float decay = 1.0;
+  vec3 shafts = vec3(0.0);
+  // Raymarch radial pixel→sol: só trechos de céu com brilho (o disco e o
+  // halo visível) contribuem; serras/terreno/nave no caminho interrompem
+  // os raios — os feixes nascem exatamente das silhuetas oclusoras.
+  for (int i = 0; i < 48; i++) {
+    if (i >= steps) break;
+    sampleUv += delta;
+    if (sampleUv.x < 0.0 || sampleUv.y < 0.0 || sampleUv.x > 1.0 || sampleUv.y > 1.0) break;
+    float sampleDepth = texture(tDepth, sampleUv).r;
+    if (sampleDepth > 0.96) {
+      vec3 sampleColor = texture(tColor, sampleUv).rgb;
+      float bright = smoothstep(0.55, 1.35, luminance(sampleColor));
+      shafts += sampleColor * bright * decay;
+    }
+    decay *= 0.94;
+  }
+  float dayFactor = sunDayFactor();
+  shafts *= uPost.z * dayFactor / max(float(steps) * 0.32, 1.0);
+  outColor = vec4(max(shafts, 0.0), 1.0);
+}
+`;
+
+export const DUST_VERTEX = /* glsl */ `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aPosition;
+layout(location = 1) in vec4 iSeed;
+${GLOBALS}
+out vec2 vLocal;
+out vec2 vWorld;
+out float vLayer;
+float dustHash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+void main() {
+  float h1 = dustHash(iSeed.xy);
+  float h2 = dustHash(iSeed.zw);
+  float h3 = dustHash(iSeed.xy + 17.31);
+  float layer = 0.35 + 0.65 * h3;
+  float time = uResolutionTime.z;
+  vec2 world;
+  world.x = fract(h1 + time * (0.0025 + 0.006 * layer) * max(uAtmosphere.z, 0.12));
+  world.y = 0.13 + h2 * 0.80 + sin(time * (0.11 + layer * 0.13) + iSeed.x * 39.0) * 0.012;
+  float size = mix(0.0025, 0.0085, layer);
+  vec2 local = aPosition - 0.5;
+  world += local * vec2(size / max(uSun.w, 0.001), size);
+  vLocal = local;
+  vWorld = world;
+  vLayer = layer;
+  gl_Position = vec4(world * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+export const DUST_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vLocal;
+in vec2 vWorld;
+in float vLayer;
+${GLOBALS}
+${SUN_CYCLE}
+uniform sampler2D tLightAccum;
+uniform vec4 uPointLightsA[4];
+uniform vec4 uPointLightsB[4];
+uniform float uPointLightGlobal;
+layout(location = 0) out vec4 outColor;
+float luminance(vec3 color) {
+  return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+void main() {
+  float disc = 1.0 - smoothstep(0.18, 0.5, length(vLocal));
+  if (disc <= 0.001) discard;
+  // Brilho vindo do buffer de luz acumulada na posição da partícula:
+  // poeira acende ao cruzar regiões iluminadas da cena...
+  vec3 accumulated = texture(tLightAccum, clamp(vWorld, vec2(0.001), vec2(0.999))).rgb;
+  float accumulatedLuma = luminance(accumulated);
+  // ...e diretamente dos feixes pontuais (farol/exaustão/beacon).
+  vec3 pointGlow = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    vec4 lightA = uPointLightsA[i];
+    vec4 lightB = uPointLightsB[i];
+    if (lightB.a <= 0.001) continue;
+    vec3 delta = vec3((lightA.x - vWorld.x) * uSun.w, lightA.y - vWorld.y, lightA.z);
+    float d = length(delta);
+    if (d >= lightA.w) continue;
+    float ratio = d / lightA.w;
+    float cutoff = max(0.0, 1.0 - ratio * ratio * ratio * ratio);
+    float attenuation = (1.0 / (1.0 + 0.9 * d + 6.0 * d * d)) * cutoff * cutoff;
+    pointGlow += lightB.rgb * (lightB.a * uPointLightGlobal * attenuation);
+  }
+  float sunBeam = exp(-length((vWorld - uSun.xy) * vec2(uSun.w, 1.0)) * 3.2) * sunDayFactor();
+  vec3 dustColor = vec3(0.62, 0.52, 0.40) * (0.05 + accumulatedLuma * 1.35 + sunBeam * 0.55) + pointGlow * 0.85;
+  float alpha = disc * uPost2.z * mix(0.05, 0.30, vLayer) * clamp(0.25 + accumulatedLuma * 1.6 + luminance(pointGlow), 0.0, 1.6);
+  outColor = vec4(dustColor * alpha, alpha);
+}
+`;
+
+export const DEBRIS_VERTEX = /* glsl */ `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aPosition;
+layout(location = 1) in vec4 iParticle;     // world xy, size, life ratio
+layout(location = 2) in vec4 iParticleData; // kind, seed, -, -
+${GLOBALS}
+out vec2 vLocal;
+out float vLife;
+out float vKind;
+void main() {
+  vec2 local = aPosition - 0.5;
+  vec2 world = iParticle.xy + local * vec2(iParticle.z / max(uSun.w, 0.001), iParticle.z);
+  vLocal = local;
+  vLife = iParticle.w;
+  vKind = iParticleData.x;
+  gl_Position = vec4(world * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+export const DEBRIS_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vLocal;
+in float vLife;
+in float vKind;
+layout(location = 0) out vec4 outColor;
+void main() {
+  float disc = 1.0 - smoothstep(0.16, 0.5, length(vLocal));
+  if (disc <= 0.001) discard;
+  // kind 0 = poeira de impacto; kind 1 = marcador incandescente do corpo físico.
+  vec3 color = mix(vec3(0.48, 0.30, 0.17), vec3(1.0, 0.44, 0.13), vKind);
+  float brightness = mix(0.55, 2.4, vKind);
+  float alpha = disc * clamp(vLife, 0.0, 1.0) * mix(0.34, 0.9, vKind);
+  outColor = vec4(color * brightness * alpha, alpha);
+}
+`;
+
 export const COMPOSITE_FRAGMENT = /* glsl */ `#version 300 es
 precision highp float;
 in vec2 vUv;
@@ -729,6 +1041,9 @@ uniform sampler2D tColor;
 uniform sampler2D tAlbedo;
 uniform sampler2D tNormalMaterial;
 uniform sampler2D tDepth;
+uniform sampler2D tBloom;
+uniform sampler2D tGodRays;
+uniform sampler2D tAdapted;
 layout(location = 0) out vec4 outColor;
 
 vec3 decodeNormal(vec2 encoded) {
@@ -758,21 +1073,29 @@ void main() {
     float contour = 1.0 - smoothstep(0.0, 0.08, abs(fract(depth * 18.0) - 0.5));
     color += contour * 0.055;
   } else {
-    vec2 texel = 1.0 / max(uResolutionTime.xy * uQuality.z, vec2(1.0));
-    color = texture(tColor, vUv).rgb;
-    vec3 bloom = vec3(0.0);
-    bloom += max(texture(tColor, vUv + vec2(texel.x * 3.0, 0.0)).rgb - 0.7, 0.0);
-    bloom += max(texture(tColor, vUv - vec2(texel.x * 3.0, 0.0)).rgb - 0.7, 0.0);
-    bloom += max(texture(tColor, vUv + vec2(0.0, texel.y * 3.0)).rgb - 0.7, 0.0);
-    bloom += max(texture(tColor, vUv - vec2(0.0, texel.y * 3.0)).rgb - 0.7, 0.0);
-    color += bloom * uLighting.z * 0.25;
-    color = aces(color * uAtmosphere.w);
+    // --- Uber-post: CA → bloom Kawase + god rays → auto-exposição →
+    // ACES → gama → vinheta → grão. Tudo sobre o HDR acumulado.
+    vec2 centeredUv = vUv - 0.5;
+    float radiusSq = dot(centeredUv * vec2(uSun.w, 1.0), centeredUv * vec2(uSun.w, 1.0));
+    // Aberração cromática radial: offset = distortion · r²
+    vec2 caOffset = centeredUv * radiusSq * uPost.w * 0.012;
+    color.r = texture(tColor, vUv + caOffset).r;
+    color.g = texture(tColor, vUv).g;
+    color.b = texture(tColor, vUv - caOffset).b;
+    color += texture(tBloom, vUv).rgb * (uLighting.z * uPost2.w);
+    // A intensidade já está embutida na textura de god rays; o step só
+    // impede que uma textura antiga reapareça ao desligar o efeito.
+    color += texture(tGodRays, vUv).rgb * step(0.0001, uPost.z);
+    // Eye adaptation (1×1 ping-pong); desligada = fator neutro.
+    float adaptedExposure = texture(tAdapted, vec2(0.5)).r;
+    float exposureFactor = mix(1.0, adaptedExposure, uPost2.x);
+    color = aces(color * uAtmosphere.w * exposureFactor);
     color = pow(color, vec3(1.0 / 2.2));
-    vec2 centered = (vUv - 0.5) * vec2(0.82, 1.0);
-    float vignette = 1.0 - dot(centered, centered) * 0.52;
+    vec2 centered = centeredUv * vec2(0.82, 1.0);
+    float vignette = smoothstep(1.05, 0.32, length(centered * 1.65)) * 0.42 + 0.58;
     color *= vignette;
     float grain = hash12(gl_FragCoord.xy + mod(uResolutionTime.w, 16.0)) - 0.5;
-    color += grain * 0.011;
+    color += grain * 0.011 * (0.8 + 0.2 * sin(uResolutionTime.z * 7.0));
   }
   outColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }

@@ -84,7 +84,7 @@
         <div class="boot-screen" id="bootScreen">
           <div class="boot-loader"><i></i><i></i><i></i></div>
           <span>COMPILANDO PIPELINE</span>
-          <small>MRT · VOLUMETRICS · SSR · DENOISE</small>
+          <small>MRT · POST AAA · Physics · SPATIAL AUDIO</small>
         </div>
         <div class="error-screen" id="errorScreen" hidden>
           <strong>WebGL2 não disponível</strong>
@@ -99,7 +99,7 @@
         <svg><use href="#i-chevron"/></svg>
         <div class="pipeline-node" id="denoiseNode"><span>03</span><div><strong>DENOISE</strong><small>edge-aware · 5 × 5</small></div></div>
         <svg><use href="#i-chevron"/></svg>
-        <div class="pipeline-node"><span>04</span><div><strong>COMPOSITE</strong><small>ACES · upscale</small></div></div>
+        <div class="pipeline-node"><span>04</span><div><strong>UBER POST</strong><small>Kawase · god rays · ACES</small></div></div>
       </div>
 
       <div class="telemetry-bar">
@@ -161,8 +161,50 @@
           </div>
         </section>
 
+        <section class="control-section">
+          <div class="section-heading"><span>03</span><h3>Pós-processamento</h3><small>CINEMATIC</small></div>
+          <label class="slider-control" for="bloomThreshold">
+            <span>Threshold do bloom <output id="bloomThresholdValue">0.72</output></span>
+            <input id="bloomThreshold" type="range" min="0" max="1.5" value="0.72" step="0.01">
+          </label>
+          <label class="slider-control" for="bloomIntensity">
+            <span>Intensidade do bloom <output id="bloomIntensityValue">0.55</output></span>
+            <input id="bloomIntensity" type="range" min="0" max="1.5" value="0.55" step="0.01">
+          </label>
+          <label class="slider-control" for="godRayIntensity">
+            <span>God rays <output id="godRayIntensityValue">0.50</output></span>
+            <input id="godRayIntensity" type="range" min="0" max="1.5" value="0.5" step="0.01">
+          </label>
+          <label class="slider-control" for="chromaticAberration">
+            <span>Aberração cromática <output id="chromaticAberrationValue">0.35</output></span>
+            <input id="chromaticAberration" type="range" min="0" max="1.5" value="0.35" step="0.01">
+          </label>
+          <div class="toggle-list">
+            <label class="toggle-row" for="bloomEnabled"><span><strong>Bloom Kawase</strong><small>Pirâmide down/up de 5 níveis</small></span><input id="bloomEnabled" type="checkbox" checked><i></i></label>
+            <label class="toggle-row" for="godRaysEnabled"><span><strong>God rays screen-space</strong><small>Raymarch radial a partir do sol</small></span><input id="godRaysEnabled" type="checkbox" checked><i></i></label>
+            <label class="toggle-row" for="autoExposureEnabled"><span><strong>Auto-exposição</strong><small>Adaptação ocular por luminância</small></span><input id="autoExposureEnabled" type="checkbox" checked><i></i></label>
+          </div>
+        </section>
+
+        <section class="control-section">
+          <div class="section-heading"><span>04</span><h3>Luzes &amp; poeira</h3><small>DYNAMIC</small></div>
+          <label class="slider-control" for="pointLightIntensity">
+            <span>Luzes pontuais <output id="pointLightIntensityValue">1.00</output></span>
+            <input id="pointLightIntensity" type="range" min="0" max="2" value="1" step="0.01">
+          </label>
+          <label class="slider-control" for="dustIntensity">
+            <span>Poeira volumétrica <output id="dustIntensityValue">0.75</output></span>
+            <input id="dustIntensity" type="range" min="0" max="1.5" value="0.75" step="0.01">
+          </label>
+          <div class="toggle-list">
+            <label class="toggle-row" for="pointLightsEnabled"><span><strong>Luzes dinâmicas</strong><small>Farol · exaustão · beacon · painel</small></span><input id="pointLightsEnabled" type="checkbox" checked><i></i></label>
+            <label class="toggle-row" for="dustEnabled"><span><strong>Dust motes</strong><small>Brilho amostrado da luz acumulada</small></span><input id="dustEnabled" type="checkbox" checked><i></i></label>
+            <label class="toggle-row" for="audioEnabled"><span><strong>Áudio espacial HRTF</strong><small>Reverb convolutivo do cânion</small></span><input id="audioEnabled" type="checkbox"><i></i></label>
+          </div>
+        </section>
+
         <section class="control-section quality-section">
-          <div class="section-heading"><span>03</span><h3>Performance</h3><small>ADAPTIVE</small></div>
+          <div class="section-heading"><span>05</span><h3>Performance</h3><small>ADAPTIVE</small></div>
           <div class="quality-presets" role="group" aria-label="Preset de qualidade">
             <button data-quality="performance" type="button">Performance</button>
             <button data-quality="balanced" class="active" type="button">Balanceado</button>
@@ -184,7 +226,7 @@
 
       <footer class="panel-footer">
         <span><i></i><b id="instanceCount">—</b> INSTANCES / 1 BATCH</span>
-        <span>UBO · BINDING 0</span>
+        <span id="assetStatus">ASSETS · IDLE</span>
       </footer>
     </aside>
   </main>
@@ -204,7 +246,9 @@
       <article><span>PASS 01</span><h3>G-Buffer / MRT</h3><p>Um único batch instanciado escreve albedo + emissão, normais + rugosidade + metalicidade e profundidade linear.</p><code>RGBA8 · RGBA16F · RGBA16F</code></article>
       <article><span>PASS 02</span><h3>Lighting / Volumes</h3><p>Cook–Torrance simplificado, shadow march, SSR com refinamento binário, névoa fBm e nuvens com self-shadowing.</p><code>RGBA16F · dynamic resolution</code></article>
       <article><span>PASS 03</span><h3>Guided Denoise</h3><p>Kernel 5×5 com pesos espaciais, similaridade de profundidade e alinhamento de normais para preservar as bordas.</p><code>25 taps · edge-aware</code></article>
-      <article><span>PASS 04</span><h3>Composite</h3><p>Upsampling, bloom sutil, tone mapping ACES, correção gama, vinheta e views de diagnóstico do G-Buffer.</p><code>Native resolution · canvas</code></article>
+      <article><span>PASS 04</span><h3>Uber Post</h3><p>Auto-exposição por cadeia log de luminância com ping-pong 1×1, bloom Kawase de 5 níveis, god rays radiais ocluídos pelo depth, aberração cromática, ACES, vinheta e grão.</p><code>HDR chain · native output</code></article>
+      <article><span>Pillar 2</span><h3>Luzes &amp; partículas</h3><p>Quatro luzes pontuais Cook–Torrance com atenuação física, cutoff e sombra screen-space; dust motes GPU iluminados pela luz acumulada e debris CPU gerados por impactos físicos.</p><code>4 point lights · instanced dust</code></article>
+      <article><span>Pillar 6</span><h3>Sistemas</h3><p>Grid espacial com culling/LOD, física círculo×terreno/AABB com impulsos, AssetManager assíncrono e áudio espacial HRTF com convolver procedural.</p><code>systems · zero-dep</code></article>
     </div>
     <div class="architecture-note"><strong>Nota de engenharia</strong><p>SSR 2D só pode reutilizar informação já visível no G-Buffer; o denoiser é espacial, sem histórico temporal. São escolhas que evitam ghosting e mantêm o custo previsível.</p></div>
     <div class="dialog-footer"><span>Sem dependências · WebGL2 / GLSL ES 3.00</span><a href="./README.md" target="_blank" rel="noreferrer">Abrir documentação ↗</a></div>

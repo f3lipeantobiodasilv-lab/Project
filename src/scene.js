@@ -1,3 +1,5 @@
+import { SpatialGrid, lodForBounds, makeBounds } from './spatial.js';
+
 const FLOATS_PER_INSTANCE = 16;
 
 export class SceneBatch {
@@ -5,6 +7,11 @@ export class SceneBatch {
     this.gl = gl;
     this.maxInstances = maxInstances;
     this.count = 0;
+    this.totalCount = 0;
+    this.entities = [];
+    this.grid = null;
+    this.sourceData = null;
+    this.visibleStats = { visible: 0, culled: 0, lod: [0, 0, 0] };
     this.data = new Float32Array(maxInstances * FLOATS_PER_INSTANCE);
     this.vao = gl.createVertexArray();
     this.quadBuffer = gl.createBuffer();
@@ -48,7 +55,50 @@ export class SceneBatch {
     data[offset + 13] = seed;
     data[offset + 14] = depth;
     data[offset + 15] = variant;
+    this.entities.push({ index: this.count, bounds: makeBounds(cx, cy, width, height, 0.01) });
     this.count++;
+  }
+
+  // Constrói o grid espacial sobre as instâncias e aplica o primeiro
+  // culling. O buffer enviado à GPU passa a conter só o subconjunto
+  // visível, sempre na ordem original (painter's order preservado).
+  buildIndex(viewport = { x: 0, y: 0, width: 1, height: 1 }) {
+    this.totalCount = this.count;
+    this.sourceData = this.data.slice(0, this.count * FLOATS_PER_INSTANCE);
+    this.grid = new SpatialGrid(0.125);
+    for (let i = 0; i < this.entities.length; i++) {
+      this.grid.insert(this.entities[i].index, this.entities[i].bounds);
+    }
+    return this.setViewport(viewport);
+  }
+
+  setViewport(viewport) {
+    if (!this.grid || !this.sourceData) return this.visibleStats;
+    const viewBounds = {
+      minX: viewport.x, minY: viewport.y,
+      maxX: viewport.x + viewport.width, maxY: viewport.y + viewport.height
+    };
+    const visible = this.grid.query(viewBounds);
+    const focusX = viewport.x + viewport.width * 0.5;
+    const focusY = viewport.y + viewport.height * 0.5;
+    const lod = [0, 0, 0];
+    let write = 0;
+    for (let i = 0; i < this.entities.length; i++) {
+      const entity = this.entities[i];
+      if (!visible.has(entity.index)) continue;
+      const sourceOffset = entity.index * FLOATS_PER_INSTANCE;
+      const targetOffset = write * FLOATS_PER_INSTANCE;
+      this.data.set(this.sourceData.subarray(sourceOffset, sourceOffset + FLOATS_PER_INSTANCE), targetOffset);
+      const level = lodForBounds(entity.bounds, focusX, focusY);
+      lod[level]++;
+      // vColor.a não é usado como alfa pelo geometry shader: vira o LOD.
+      this.data[targetOffset + 7] = 1 + level;
+      write++;
+    }
+    this.count = write;
+    this.visibleStats = { visible: write, culled: this.totalCount - write, lod };
+    this.upload();
+    return this.visibleStats;
   }
 
   upload() {
@@ -64,7 +114,7 @@ export class SceneBatch {
   }
 }
 
-function terrainApprox(x) {
+export function terrainApprox(x) {
   let h = 0.245 + Math.sin(x * 9 + 0.4) * 0.026 + Math.sin(x * 21) * 0.014;
   h -= Math.exp(-Math.pow((x - 0.37) / 0.075, 2)) * 0.025;
   h -= Math.exp(-Math.pow((x - 0.72) / 0.055, 2)) * 0.018;
@@ -126,6 +176,6 @@ export function buildScene(gl) {
   // ARES-7: casco metálico, canopy emissivo e painéis modulares.
   scene.add(0.56, 0.475, 0.41, 0.245, 0.48, 0.52, 0.55, 1, 0.24, 0.88, 0, 4, -0.025, 5.7, 0.16, 0);
 
-  scene.upload();
+  scene.buildIndex();
   return scene;
 }
