@@ -15,7 +15,7 @@ Também é possível servir os arquivos com qualquer servidor HTTP estático. Co
 
 ## Controles
 
-- **Arrastar na cena:** reposiciona o sol e todas as luzes/sombras dependentes.
+- **Arrastar na cena:** reposiciona o sol e todas as luzes/sombras dependentes. Arraste-o para abaixo do horizonte (`y ≈ 0.245`) para entrar no crepúsculo/noite: luz direta, SSR, nuvens e fog apagam, e só o ambiente de luar e os emissivos (nave, lâmpadas, estrelas) permanecem.
 - **Espaço:** pausa/retoma o tempo da simulação.
 - **R:** restaura os parâmetros iniciais.
 - **1–4:** Final, Albedo, Normais e Depth.
@@ -66,6 +66,7 @@ Todos os objetos compartilham um quad instanciado e um único draw call. SDFs no
 
 ### Pass 2 — Lighting / volumes
 
+- **Ciclo dia/noite:** `SUN_CYCLE` (em `shaders.js`) deriva `sunElevation` de `uSun.y` relativo ao horizonte (`0.245`), `dayFactor = smoothstep(-0.15, 0.05, sunElevation)` para céu/fog/nuvens/ambiente e `directFactor = smoothstep(0.0, 0.08, sunElevation)` para a luz direta e o SSR — ambos chegam a zero à noite. O emissivo do G-Buffer é somado só depois de nuvens e fog, então luzes artificiais não apagam com o sol.
 - **PBR:** GGX + Smith–Schlick + Fresnel de Schlick em um Cook–Torrance simplificado.
 - **SSR:** reflexão calculada da normal 2D, march linear, quatro iterações de refinamento binário, blur proporcional à rugosidade e fade nas bordas.
 - **Fog:** raymarch com jitter espacial/temporal, densidade fBm, atenuação exponencial e early exit por transmitância.

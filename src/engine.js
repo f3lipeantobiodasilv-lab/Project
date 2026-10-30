@@ -145,7 +145,9 @@ export class Engine2D {
   updateSunFromPointer(event) {
     const rect = this.canvas.getBoundingClientRect();
     this.sunX = Math.min(0.94, Math.max(0.06, (event.clientX - rect.left) / rect.width));
-    this.sunY = Math.min(0.92, Math.max(0.12, 1 - (event.clientY - rect.top) / rect.height));
+    // O mínimo permite arrastar o sol para *abaixo* do horizonte da cena
+    // (y ≈ 0.245 nos shaders): é isso que dispara a noite (dayFactor → 0).
+    this.sunY = Math.min(0.92, Math.max(0.02, 1 - (event.clientY - rect.top) / rect.height));
     if (this.callbacks.onSunChange) this.callbacks.onSunChange(this.sunX, this.sunY);
   }
 
