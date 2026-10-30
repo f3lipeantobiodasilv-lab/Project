@@ -6,6 +6,8 @@ layout(std140) uniform Globals {
   vec4 uLighting;       // SSR, AO, bloom, debug view
   vec4 uQuality;        // fog steps, cloud slices, render scale, SSR steps
   vec4 uFlags;          // SSR, fog, clouds, denoise
+  vec4 uPost;           // bloom threshold, bloom knee, god-ray intensity, chromatic aberration
+  vec4 uPost2;          // auto-exposure on/off, god-ray steps, dust intensity, bloom on/off
 };
 `;
 
@@ -32,6 +34,33 @@ float fbm2(vec2 p) {
     amplitude *= 0.48;
   }
   return value;
+}
+`;
+
+// Ciclo dia/noite compartilhado entre o G-Buffer (céu/disco solar) e o
+// lighting pass (PBR, SSR, nuvens e raymarch do fog).
+// NOTA DE ADAPTAÇÃO: neste projeto não existe `u_sunPosition` (vec3 de
+// direção); o sol é `uSun.xy`, uma *posição* screen-space em [0,1] escrita
+// pela Engine2D no UBO. `normalize(uSun.xy).y` seria sempre > 0 e a noite
+// nunca chegaria — por isso a elevação é a altura normalizada dessa
+// posição em relação ao horizonte da cena (terrainHeight ≈ 0.245).
+const SUN_CYCLE = /* glsl */ `
+const float SUN_HORIZON_Y = 0.245;
+float computeSunElevation() {
+  // 0 no horizonte, ~+1 no topo da tela, negativo abaixo do horizonte.
+  return (uSun.y - SUN_HORIZON_Y) / (1.0 - SUN_HORIZON_Y);
+}
+float sunDayFactor() {
+  // Fade suave do crepúsculo: 1 em dia pleno, 0 em noite fechada.
+  return smoothstep(-0.15, 0.05, computeSunElevation());
+}
+float sunDirectFactor() {
+  // Luz direta/especular: zero garantido com o sol abaixo do horizonte.
+  return smoothstep(0.0, 0.08, computeSunElevation());
+}
+vec3 sunTint(float elevation) {
+  // Sol avermelhado perto do horizonte, quente/alaranjado em dia pleno.
+  return mix(vec3(1.0, 0.30, 0.09), vec3(1.0, 0.69, 0.43), smoothstep(0.0, 0.35, elevation));
 }
 `;
 
@@ -87,6 +116,7 @@ in vec4 vMaterial;
 in vec4 vParams;
 ${GLOBALS}
 ${NOISE_2D}
+${SUN_CYCLE}
 layout(location = 0) out vec4 outAlbedo;
 layout(location = 1) out vec4 outNormalMaterial;
 layout(location = 2) out vec4 outDepth;
@@ -122,16 +152,22 @@ void main() {
   float metallic = vMaterial.y;
   float emission = vMaterial.z;
   float depth = vParams.z;
+  // LOD vindo do SpatialGrid (codificado em vColor.a = 1 + lod pela
+  // SceneBatch): 0 perto/grande, 2 distante/pequeno.
+  float lodLevel = clamp(vColor.a - 1.0, 0.0, 2.0);
 
   if (type < 0.5) {
     float y = vWorld.y;
-    vec3 horizon = vec3(0.19, 0.083, 0.072);
-    vec3 middle = vec3(0.055, 0.061, 0.105);
-    vec3 zenith = vec3(0.008, 0.014, 0.032);
+    float sunElevation = computeSunElevation();
+    float dayFactor = smoothstep(-0.15, 0.05, sunElevation);
+    // B.3 — fundo: gradiente diurno ↔ fundo noturno conforme o dayFactor.
+    vec3 horizon = mix(vec3(0.022, 0.026, 0.048), vec3(0.38, 0.165, 0.105), dayFactor);
+    vec3 middle = mix(vec3(0.007, 0.011, 0.027), vec3(0.115, 0.125, 0.205), dayFactor);
+    vec3 zenith = mix(vec3(0.002, 0.004, 0.012), vec3(0.020, 0.038, 0.088), dayFactor);
     color = mix(horizon, middle, smoothstep(0.12, 0.52, y));
     color = mix(color, zenith, smoothstep(0.48, 0.98, y));
     float haze = fbm2(vWorld * vec2(3.0, 5.0) + vec2(0.0, uResolutionTime.z * 0.003));
-    color += vec3(0.055, 0.025, 0.035) * haze * (1.0 - y) * 0.55;
+    color += vec3(0.055, 0.025, 0.035) * haze * (1.0 - y) * mix(0.04, 0.55, dayFactor);
 
     vec2 starGrid = vWorld * vec2(330.0, 190.0);
     vec2 starCell = floor(starGrid);
@@ -139,13 +175,19 @@ void main() {
     float starSeed = hash12(starCell);
     float star = step(0.993, starSeed) * (1.0 - smoothstep(0.015, 0.11, length(starUv)));
     star *= smoothstep(0.42, 0.78, y);
+    // Estrelas são emissivas: somem de dia e voltam a brilhar à noite.
+    star *= mix(1.0, 0.12, dayFactor);
     color += star * mix(vec3(0.35, 0.48, 0.75), vec3(0.9, 0.74, 0.58), hash12(starCell + 4.0));
     emission = star * 0.45;
 
     float sunDistance = length((vWorld - uSun.xy) * vec2(uSun.w, 1.0));
     float sunDisc = 1.0 - smoothstep(0.008, 0.012, sunDistance);
-    color = mix(color, vec3(1.0, 0.86, 0.61), sunDisc);
-    emission = max(emission, sunDisc);
+    // O disco desvanece ao longo do crepúsculo e some na noite fechada,
+    // avermelhando enquanto cruza o horizonte.
+    float sunVisibility = dayFactor;
+    vec3 sunDiscColor = mix(vec3(1.0, 0.32, 0.10), vec3(1.0, 0.86, 0.61), smoothstep(0.02, 0.4, sunElevation));
+    color = mix(color, sunDiscColor, sunDisc * sunVisibility);
+    emission = max(emission, sunDisc * sunVisibility);
     normal = vec2(0.0);
     roughness = 1.0;
     metallic = 0.0;
@@ -170,7 +212,7 @@ void main() {
     color = mix(vec3(0.115, 0.045, 0.026), vColor.rgb, 0.48 + grit * 0.52);
     color *= 0.76 + strata * 0.14;
     color += vec3(0.11, 0.047, 0.018) * smoothstep(height - 0.045, height, vWorld.y);
-    float pebble = step(0.985, hash12(floor(vWorld * vec2(560.0, 330.0))));
+    float pebble = lodLevel < 1.5 ? step(0.985, hash12(floor(vWorld * vec2(560.0, 330.0)))) : 0.0;
     color += pebble * vec3(0.12, 0.08, 0.05);
     normal = normalize(vec2(-derivative * 0.3 + (grit - 0.5) * 0.34, 1.0));
     roughness = 0.88;
@@ -182,7 +224,8 @@ void main() {
     float distanceToEdge = length(p) - edge;
     if (distanceToEdge > 0.0) discard;
     float rockNoise = fbm2(vUv * 7.0 + vParams.y);
-    color = vColor.rgb * (0.64 + rockNoise * 0.65);
+    // Em LOD 2 o micro-detalhe vira aliasing: achata o contraste do fBm.
+    color = vColor.rgb * (0.64 + rockNoise * mix(0.65, 0.30, lodLevel * 0.5));
     color *= 0.84 + max(p.y, 0.0) * 0.18;
     normal = normalize(p * 0.72 + vec2((rockNoise - 0.5) * 0.3, 0.55));
     roughness = 0.84;
@@ -272,9 +315,15 @@ precision highp int;
 in vec2 vUv;
 ${GLOBALS}
 ${NOISE_2D}
+${SUN_CYCLE}
 uniform sampler2D tAlbedo;
 uniform sampler2D tNormalMaterial;
 uniform sampler2D tDepth;
+// Luzes pontuais dinâmicas (Pillar 2): A = pos xy, altura z, raio;
+// B = cor rgb, intensidade. Preenchido por DynamicLightBank.
+uniform vec4 uPointLightsA[4];
+uniform vec4 uPointLightsB[4];
+uniform float uPointLightGlobal;
 layout(location = 0) out vec4 outColor;
 const float PI = 3.14159265359;
 
@@ -336,6 +385,41 @@ float ambientOcclusion(vec2 uv, float depth) {
   return 1.0 - occ * 0.075 * uLighting.y;
 }
 
+// --- Screen-Space Sun Occlusion -------------------------------------------
+// Passo A/B: neste projeto uSun.xy já é a posição do sol em UV de tela
+// (0..1, mesmo espaço de vUv/tDepth) — não há matriz de projeção a aplicar.
+// O RT_Depth (tDepth) NÃO é um depth buffer 0..1 de câmera: é a camada 2D
+// do G-Buffer, onde o céu escreve exatamente 1.0 e todo sólido escreve
+// <= 0.86 (serras; terreno 0.48, nave 0.16...). Por isso a referência do
+// sol é sunDepth = 1.0 e o smoothstep usa a faixa 0.96..0.99 já usada
+// neste shader para separar céu (depth > 0.96) de geometria.
+float sunOcclusionTap(vec2 sunUV) {
+  float occlusionDepth = texture(tDepth, sunUV).r;
+  float sunDepth = 1.0;
+  return smoothstep(sunDepth - 0.04, sunDepth - 0.01, occlusionDepth);
+}
+
+float computeSunVisibility() {
+  vec2 sunUV = clamp(uSun.xy, vec2(0.002), vec2(0.998));
+  // Amostrar só o pixel central viraria um degrau seco: neste RT os
+  // valores saltam de 1.0 (céu) para 0.86 (serra) sem valores entre eles,
+  // então o smoothstep de profundidade sozinho não suaviza nada. Em vez
+  // disso amostramos a *pegada do disco solar* (raio 0.012 na métrica
+  // corrigida por aspecto do geometry pass): a fração de taps que ainda
+  // enxerga céu é a visibilidade — oclusão parcial = fade suave quando
+  // o sol desliza para trás do relevo.
+  float discRadius = 0.012;
+  vec2 ringRadius = vec2(discRadius / max(uSun.w, 0.001), discRadius);
+  float visibility = sunOcclusionTap(sunUV) * 0.20;
+  for (int i = 0; i < 8; i++) {
+    float angle = 6.2831853 * (float(i) / 8.0);
+    vec2 ringOffset = vec2(cos(angle) * ringRadius.x, sin(angle) * ringRadius.y);
+    visibility += sunOcclusionTap(sunUV + ringOffset) * 0.075;
+    visibility += sunOcclusionTap(sunUV + ringOffset * 0.5) * 0.025;
+  }
+  return clamp(visibility, 0.0, 1.0);
+}
+
 float cloudField(vec2 p, float slice) {
   float time = uResolutionTime.z;
   vec2 wind = vec2(time * 0.011, -time * 0.002) * uAtmosphere.z;
@@ -358,6 +442,9 @@ float cloudGroundShadow(vec2 uv) {
 
 vec4 cloudLayer(vec2 uv, vec2 lightDir, float jitter) {
   if (uv.y < 0.46 || uv.y > 1.01) return vec4(0.0);
+  // Sem sol acima do horizonte, a nuvem vira silhueta sobre o céu noturno.
+  float cloudDayFactor = sunDayFactor();
+  vec3 cloudSunColor = sunTint(computeSunElevation());
   float transmittance = 1.0;
   vec3 scattering = vec3(0.0);
   int slices = int(uQuality.y + 0.5);
@@ -369,8 +456,8 @@ vec4 cloudLayer(vec2 uv, vec2 lightDir, float jitter) {
       float lightDensity = cloudField(uv + lightDir * 0.025, slice + 0.09);
       lightDensity += cloudField(uv + lightDir * 0.055, slice + 0.18) * 0.65;
       float lightTransmittance = exp(-lightDensity * 2.25);
-      vec3 shadowColor = vec3(0.095, 0.105, 0.15);
-      vec3 litColor = vec3(0.73, 0.57, 0.48);
+      vec3 shadowColor = mix(vec3(0.006, 0.009, 0.020), vec3(0.095, 0.105, 0.15), cloudDayFactor);
+      vec3 litColor = mix(vec3(0.010, 0.016, 0.034), cloudSunColor * 0.78, cloudDayFactor);
       vec3 cloudColor = mix(shadowColor, litColor, lightTransmittance);
       float alpha = 1.0 - exp(-density * 0.78);
       scattering += transmittance * alpha * cloudColor;
@@ -390,7 +477,11 @@ float fogDensity(vec2 p) {
   return (wisps * lowAltitude * 1.75 + 0.018) * uAtmosphere.x;
 }
 
-vec4 integrateFog(vec2 uv, vec2 lightDir, float sunDistance, float jitter) {
+vec4 integrateFog(vec2 uv, vec2 lightDir, float sunDistance, float jitter, float sunVisibility) {
+  // B — o scattering acumulado é atenuado pelo ciclo: à noite o
+  // Rayleigh/Mie solar zera e resta só um resíduo de luar azul-marinho.
+  float fogDayFactor = sunDayFactor();
+  float fogIrradiance = mix(0.035, uSun.z, fogDayFactor);
   int steps = int(uQuality.x + 0.5);
   float rayLength = min(sunDistance, 0.92);
   float stepLength = rayLength / float(steps);
@@ -406,9 +497,13 @@ vec4 integrateFog(vec2 uv, vec2 lightDir, float sunDistance, float jitter) {
     float interval = stepLength * mix(0.78, 1.28, smoothstep(0.18, 0.7, p.y));
     float extinction = exp(-density * interval * 3.1);
     float attenuation = exp(-1.35 * t);
-    vec3 fogTint = mix(vec3(0.34, 0.105, 0.055), vec3(0.12, 0.21, 0.38), smoothstep(0.15, 0.75, p.y));
-    float phase = 0.48 + exp(-sunDistance * 3.5) * 1.35;
-    scattering += transmittance * (1.0 - extinction) * fogTint * attenuation * phase * uSun.z;
+    vec3 dayFogTint = mix(vec3(0.34, 0.105, 0.055), vec3(0.12, 0.21, 0.38), smoothstep(0.15, 0.75, p.y));
+    vec3 fogTint = mix(vec3(0.006, 0.010, 0.024), dayFogTint, fogDayFactor);
+    // À noite a fase perde o forward-scattering solar (o "brilho" Mie) —
+    // e ele também some quando o sol está ocluído pelo relevo: sem disco
+    // visível, não há fonte para o halo volumétrico em torno dele.
+    float phase = mix(0.05, 0.48 + exp(-sunDistance * 3.5) * 1.35 * sunVisibility, fogDayFactor);
+    scattering += transmittance * (1.0 - extinction) * fogTint * attenuation * phase * fogIrradiance;
     transmittance *= extinction;
     t += interval;
     if (transmittance < 0.01) break;
@@ -449,7 +544,11 @@ vec4 traceSSR(vec2 uv, vec2 normal, float depth, float roughness, float jitter) 
   if (hit < 0.5) return vec4(0.0);
 
   vec4 hitAlbedo = texture(tAlbedo, hitUv);
-  vec3 reflected = hitAlbedo.rgb * (0.5 + uSun.z * 0.28) + hitAlbedo.rgb * hitAlbedo.a * 2.0;
+  // A parcela solar do reflexo (SSR) morre com o sol; a parcela emissiva
+  // (reflexo de lâmpadas/janelas) é preservada para brilhar à noite.
+  float ssrDirectFactor = sunDirectFactor();
+  vec3 reflected = hitAlbedo.rgb * (0.5 + uSun.z * 0.28) * mix(0.07, 1.0, ssrDirectFactor)
+                 + hitAlbedo.rgb * hitAlbedo.a * 2.0;
   vec2 blurDirection = vec2(-rayDir.y, rayDir.x) * roughness * 0.014;
   reflected = reflected * 0.4
     + texture(tAlbedo, hitUv + blurDirection).rgb * 0.15
@@ -489,6 +588,44 @@ vec3 cookTorrance(vec3 baseColor, vec3 N, vec3 L, vec3 V, float roughness, float
   return (diffuse + specular) * radiance * NdotL;
 }
 
+// Oclusão de uma luz pontual: marcha curta pixel→luz sobre o RT_Depth.
+// Camadas mais próximas da câmera (depth menor) entre o pixel e a luz
+// bloqueiam a contribuição — é o mesmo princípio do screenShadow solar,
+// mas radial e por luz.
+float pointLightOcclusion(vec2 uv, float depth, vec2 lightUv) {
+  float occlusion = 0.0;
+  for (int i = 1; i <= 6; i++) {
+    float t = float(i) / 7.0;
+    vec2 p = mix(uv, lightUv, t);
+    float sampleDepth = texture(tDepth, p).r;
+    if (sampleDepth < depth - 0.045 && sampleDepth < 0.96) occlusion += 0.45;
+  }
+  return clamp(1.0 - occlusion, 0.12, 1.0);
+}
+
+vec3 evaluatePointLights(vec3 baseColor, vec3 N, vec3 V, float roughness, float metallic, float depth, vec2 uv) {
+  if (uPointLightGlobal <= 0.001) return vec3(0.0);
+  vec3 total = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    vec4 lightA = uPointLightsA[i];
+    vec4 lightB = uPointLightsB[i];
+    if (lightB.a <= 0.001 || lightA.w <= 0.001) continue;
+    vec3 delta = vec3((lightA.x - uv.x) * uSun.w, lightA.y - uv.y, lightA.z);
+    float distanceToLight = length(delta);
+    if (distanceToLight >= lightA.w) continue;
+    vec3 L = delta / max(distanceToLight, 0.0001);
+    // Atenuação física (inverso do quadrado suavizado) × cutoff suave:
+    //   1 / (1 + c1·d + c2·d²) · (1 − (d/radius)⁴)²
+    float cutoffRatio = distanceToLight / lightA.w;
+    float cutoff = max(0.0, 1.0 - cutoffRatio * cutoffRatio * cutoffRatio * cutoffRatio);
+    float attenuation = (1.0 / (1.0 + 0.9 * distanceToLight + 6.0 * distanceToLight * distanceToLight)) * cutoff * cutoff;
+    float occlusion = pointLightOcclusion(uv, depth, lightA.xy);
+    vec3 radiance = lightB.rgb * (lightB.a * uPointLightGlobal * attenuation * occlusion);
+    total += cookTorrance(baseColor, N, L, V, roughness, metallic, radiance);
+  }
+  return total;
+}
+
 void main() {
   vec2 uv = vUv;
   vec4 albedo = texture(tAlbedo, uv);
@@ -503,20 +640,47 @@ void main() {
   float jitter = fract(blueNoise(gl_FragCoord.xy) + mod(uResolutionTime.w, 8.0) * 0.61803398875);
   vec3 color;
   float ssrMask = 0.0;
+  vec3 emissive = vec3(0.0);
+
+  // A — fator dia/noite a partir da elevação solar (ver SUN_CYCLE).
+  float sunElevation = computeSunElevation();
+  float dayFactor = smoothstep(-0.15, 0.05, sunElevation);
+  float directFactor = smoothstep(0.0, 0.08, sunElevation);
+  // Oclusão screen-space do sol (17 taps na pegada do disco, calculada
+  // 1× por pixel e reutilizada por fog e glow — e NÃO pela radiância
+  // direta, que já tem sombra por-pixel via screenShadow: multiplicar a
+  // cena inteira por um único sample faria tudo piscar quando o centro
+  // do sol cruza uma silhueta). Só é amostrada se o passe volumétrico —
+  // o único consumidor — estiver ativo.
+  float sunVisibility = 1.0;
+  if (uFlags.y > 0.5 && uAtmosphere.x > 0.001) sunVisibility = computeSunVisibility();
 
   if (depth > 0.96) {
-    color = albedo.rgb + albedo.rgb * albedo.a * (1.4 + uSun.z * 0.75);
+    // O albedo do céu já chega com o mix dia/noite e o disco solar com
+    // fade (geometry pass). Aqui só o glow emissivo é escalado: estrelas
+    // (albedo.a) continuam acesas à noite, sem halo solar residual.
+    color = albedo.rgb + albedo.rgb * albedo.a * mix(0.55, 1.4 + uSun.z * 0.75, dayFactor);
   } else {
     float shadow = screenShadow(uv, depth, lightDir);
     float cloudShadow = uFlags.z > 0.5 ? cloudGroundShadow(uv) : 0.0;
-    shadow *= 1.0 - cloudShadow;
-    vec3 sunColor = vec3(1.0, 0.69, 0.43);
-    vec3 radiance = sunColor * uSun.z * shadow / (0.9 + sunDistance * 0.25);
+    shadow *= 1.0 - cloudShadow * directFactor;
+    vec3 sunColor = sunTint(sunElevation);
+    // Luz direta + especular Cook–Torrance zeram abaixo do horizonte.
+    vec3 radiance = sunColor * (uSun.z * directFactor) * shadow / (0.9 + sunDistance * 0.25);
     color = cookTorrance(albedo.rgb, N, L, V, material.b, material.a, radiance);
+    // Luzes pontuais (farol, exaustão, beacon, work light) — independentes
+    // do ciclo solar: é o que ilumina a cena à noite junto dos emissivos.
+    color += evaluatePointLights(albedo.rgb, N, V, material.b, material.a, depth, uv);
     float ao = ambientOcclusion(uv, depth);
-    vec3 skyAmbient = mix(vec3(0.055, 0.035, 0.04), vec3(0.09, 0.12, 0.19), clamp(N.y * 0.5 + 0.5, 0.0, 1.0));
-    color += albedo.rgb * skyAmbient * ao * 1.5;
-    color += albedo.rgb * albedo.a * 3.2;
+    float skyFacing = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
+    vec3 dayAmbient = mix(vec3(0.055, 0.035, 0.04), vec3(0.09, 0.12, 0.19), skyFacing);
+    // Ambiente noturno: apenas um resíduo fraco de luar azul-marinho.
+    vec3 nightAmbient = vec3(0.010, 0.016, 0.034) * (0.65 + 0.35 * skyFacing);
+    vec3 skyAmbient = mix(nightAmbient, dayAmbient, dayFactor);
+    color += albedo.rgb * skyAmbient * ao * mix(0.85, 1.5, dayFactor);
+    // C — o emissivo é apenas *separado* aqui; ele é somado no fim do
+    // pass, depois de nuvens/fog, para nunca ser atenuado pelo ciclo.
+    emissive = albedo.rgb * albedo.a * 3.2;
 
     if (uFlags.x > 0.5 && uLighting.x > 0.001 && (material.a > 0.08 || material.b < 0.35)) {
       vec4 ssr = traceSSR(uv, N.xy, depth, material.b, jitter);
@@ -533,14 +697,27 @@ void main() {
   }
 
   if (uFlags.y > 0.5 && uAtmosphere.x > 0.001) {
-    vec4 fog = integrateFog(uv, lightDir, sunDistance, jitter);
+    vec4 fog = integrateFog(uv, lightDir, sunDistance, jitter, sunVisibility);
     color *= 1.0 - fog.a * 0.4;
     color += fog.rgb;
     float outerGlow = exp(-sunDistance * 5.5) * uAtmosphere.x;
     float innerGlow = exp(-sunDistance * 15.0) * uAtmosphere.x;
-    color += vec3(0.055, 0.105, 0.23) * outerGlow * uSun.z * 0.34;
-    color += vec3(0.55, 0.24, 0.09) * innerGlow * uSun.z * 0.24;
+    // Passo B/5 — glow solar: este termo é aditivo e era somado a TODOS
+    // os pixels (inclusive ao terreno/nave à frente do sol) — é ele que
+    // vazava por cima das montanhas. Agora é atenuado pela visibilidade.
+    // O bloom do COMPOSITE_FRAGMENT é genérico (threshold sobre tColor)
+    // e não sabe distinguir sol de lâmpada; ele não é tocado — sem fonte
+    // solar no lighting target, não há o que ele espalhar, e o bloom dos
+    // emissivos (nave/janelas) continua intacto à noite.
+    vec3 rawSunGlow = vec3(0.055, 0.105, 0.23) * outerGlow * (uSun.z * dayFactor) * 0.34
+                    + vec3(0.55, 0.24, 0.09) * innerGlow * (uSun.z * dayFactor) * 0.24;
+    vec3 finalSunGlow = rawSunGlow * sunVisibility;
+    color += finalSunGlow;
   }
+
+  // C — emissivo por último: naves, lâmpadas e janelas seguem brilhando
+  // no escuro total, sem passar pelo fade do fog/nuvens acima.
+  color += emissive;
 
   outColor = vec4(max(color, 0.0), ssrMask);
 }
@@ -595,6 +772,266 @@ void main() {
 }
 `;
 
+export const COPY_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tColor;
+layout(location = 0) out vec4 outColor;
+void main() {
+  outColor = texture(tColor, vUv);
+}
+`;
+
+export const LUMINANCE_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tColor;
+uniform vec2 uTexel;
+uniform float uLogInput;
+layout(location = 0) out vec4 outColor;
+float luminance(vec3 color) {
+  return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+float sampleLogLuminance(vec2 uv) {
+  vec4 value = texture(tColor, uv);
+  if (uLogInput > 0.5) return value.r;
+  return log(max(luminance(value.rgb), 0.0001));
+}
+void main() {
+  // Média em espaço log: média geométrica da luminância, robusta a
+  // highlights (sol/emissivos) — base da auto-exposição.
+  float sum = sampleLogLuminance(vUv + uTexel * vec2(-0.5, -0.5));
+  sum += sampleLogLuminance(vUv + uTexel * vec2(0.5, -0.5));
+  sum += sampleLogLuminance(vUv + uTexel * vec2(-0.5, 0.5));
+  sum += sampleLogLuminance(vUv + uTexel * vec2(0.5, 0.5));
+  outColor = vec4(vec3(sum * 0.25), 1.0);
+}
+`;
+
+export const ADAPT_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tAverage;
+uniform sampler2D tPrevious;
+uniform vec4 uAdaptParams; // dt, speed, min exposure, max exposure
+layout(location = 0) out vec4 outColor;
+void main() {
+  float averageLuminance = exp(texture(tAverage, vec2(0.5)).r);
+  float targetExposure = clamp(0.34 / max(averageLuminance, 0.0001), uAdaptParams.z, uAdaptParams.w);
+  float previousExposure = texture(tPrevious, vec2(0.5)).r;
+  // Eye adaptation: Exposure_new = old + (target − old)·(1 − e^(−dt·speed))
+  float adapted = previousExposure + (targetExposure - previousExposure) * (1.0 - exp(-uAdaptParams.x * uAdaptParams.y));
+  outColor = vec4(clamp(adapted, uAdaptParams.z, uAdaptParams.w), averageLuminance, targetExposure, 1.0);
+}
+`;
+
+export const BLOOM_PREFILTER_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+${GLOBALS}
+uniform sampler2D tColor;
+layout(location = 0) out vec4 outColor;
+float luminance(vec3 color) {
+  return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+void main() {
+  vec3 color = texture(tColor, vUv).rgb;
+  float luma = luminance(color);
+  float threshold = uPost.x;
+  float knee = max(uPost.y, 0.001);
+  // High-pass com joelho suave: nada abaixo do threshold, rampa orgânica acima.
+  float soft = clamp((luma - threshold + knee) / (2.0 * knee), 0.0, 1.0);
+  soft *= soft;
+  float contribution = clamp((luma - threshold) / max(luma, 0.0001), 0.0, 1.0);
+  outColor = vec4(color * max(soft * contribution, 0.0), 1.0);
+}
+`;
+
+export const KAWASE_DOWNSAMPLE_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tColor;
+uniform vec2 uTexel;
+layout(location = 0) out vec4 outColor;
+void main() {
+  vec2 offset = uTexel * 1.5;
+  vec3 color = texture(tColor, vUv + vec2(-offset.x, -offset.y)).rgb;
+  color += texture(tColor, vUv + vec2(offset.x, -offset.y)).rgb;
+  color += texture(tColor, vUv + vec2(-offset.x, offset.y)).rgb;
+  color += texture(tColor, vUv + vec2(offset.x, offset.y)).rgb;
+  outColor = vec4(color * 0.25, 1.0);
+}
+`;
+
+export const KAWASE_UPSAMPLE_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+uniform sampler2D tColor;
+uniform vec2 uTexel;
+uniform float uRadius;
+layout(location = 0) out vec4 outColor;
+void main() {
+  vec2 o = uTexel * uRadius;
+  vec3 color = texture(tColor, vUv + vec2(-o.x, 0.0)).rgb * 2.0;
+  color += texture(tColor, vUv + vec2(o.x, 0.0)).rgb * 2.0;
+  color += texture(tColor, vUv + vec2(0.0, -o.y)).rgb * 2.0;
+  color += texture(tColor, vUv + vec2(0.0, o.y)).rgb * 2.0;
+  color += texture(tColor, vUv + vec2(-o.x, -o.y)).rgb;
+  color += texture(tColor, vUv + vec2(o.x, -o.y)).rgb;
+  color += texture(tColor, vUv + vec2(-o.x, o.y)).rgb;
+  color += texture(tColor, vUv + vec2(o.x, o.y)).rgb;
+  outColor = vec4(color * (1.0 / 12.0), 1.0);
+}
+`;
+
+export const GODRAYS_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vUv;
+${GLOBALS}
+${SUN_CYCLE}
+uniform sampler2D tColor;
+uniform sampler2D tDepth;
+layout(location = 0) out vec4 outColor;
+float luminance(vec3 color) {
+  return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+void main() {
+  vec2 sunUV = clamp(uSun.xy, vec2(0.0), vec2(1.0));
+  int steps = clamp(int(uPost2.y + 0.5), 1, 48);
+  vec2 delta = (sunUV - vUv) / float(steps);
+  vec2 sampleUv = vUv;
+  float decay = 1.0;
+  vec3 shafts = vec3(0.0);
+  // Raymarch radial pixel→sol: só trechos de céu com brilho (o disco e o
+  // halo visível) contribuem; serras/terreno/nave no caminho interrompem
+  // os raios — os feixes nascem exatamente das silhuetas oclusoras.
+  for (int i = 0; i < 48; i++) {
+    if (i >= steps) break;
+    sampleUv += delta;
+    if (sampleUv.x < 0.0 || sampleUv.y < 0.0 || sampleUv.x > 1.0 || sampleUv.y > 1.0) break;
+    float sampleDepth = texture(tDepth, sampleUv).r;
+    if (sampleDepth > 0.96) {
+      vec3 sampleColor = texture(tColor, sampleUv).rgb;
+      float bright = smoothstep(0.55, 1.35, luminance(sampleColor));
+      shafts += sampleColor * bright * decay;
+    }
+    decay *= 0.94;
+  }
+  float dayFactor = sunDayFactor();
+  shafts *= uPost.z * dayFactor / max(float(steps) * 0.32, 1.0);
+  outColor = vec4(max(shafts, 0.0), 1.0);
+}
+`;
+
+export const DUST_VERTEX = /* glsl */ `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aPosition;
+layout(location = 1) in vec4 iSeed;
+${GLOBALS}
+out vec2 vLocal;
+out vec2 vWorld;
+out float vLayer;
+float dustHash(vec2 p) {
+  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+}
+void main() {
+  float h1 = dustHash(iSeed.xy);
+  float h2 = dustHash(iSeed.zw);
+  float h3 = dustHash(iSeed.xy + 17.31);
+  float layer = 0.35 + 0.65 * h3;
+  float time = uResolutionTime.z;
+  vec2 world;
+  world.x = fract(h1 + time * (0.0025 + 0.006 * layer) * max(uAtmosphere.z, 0.12));
+  world.y = 0.13 + h2 * 0.80 + sin(time * (0.11 + layer * 0.13) + iSeed.x * 39.0) * 0.012;
+  float size = mix(0.0025, 0.0085, layer);
+  vec2 local = aPosition - 0.5;
+  world += local * vec2(size / max(uSun.w, 0.001), size);
+  vLocal = local;
+  vWorld = world;
+  vLayer = layer;
+  gl_Position = vec4(world * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+export const DUST_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vLocal;
+in vec2 vWorld;
+in float vLayer;
+${GLOBALS}
+${SUN_CYCLE}
+uniform sampler2D tLightAccum;
+uniform vec4 uPointLightsA[4];
+uniform vec4 uPointLightsB[4];
+uniform float uPointLightGlobal;
+layout(location = 0) out vec4 outColor;
+float luminance(vec3 color) {
+  return dot(color, vec3(0.2126, 0.7152, 0.0722));
+}
+void main() {
+  float disc = 1.0 - smoothstep(0.18, 0.5, length(vLocal));
+  if (disc <= 0.001) discard;
+  // Brilho vindo do buffer de luz acumulada na posição da partícula:
+  // poeira acende ao cruzar regiões iluminadas da cena...
+  vec3 accumulated = texture(tLightAccum, clamp(vWorld, vec2(0.001), vec2(0.999))).rgb;
+  float accumulatedLuma = luminance(accumulated);
+  // ...e diretamente dos feixes pontuais (farol/exaustão/beacon).
+  vec3 pointGlow = vec3(0.0);
+  for (int i = 0; i < 4; i++) {
+    vec4 lightA = uPointLightsA[i];
+    vec4 lightB = uPointLightsB[i];
+    if (lightB.a <= 0.001) continue;
+    vec3 delta = vec3((lightA.x - vWorld.x) * uSun.w, lightA.y - vWorld.y, lightA.z);
+    float d = length(delta);
+    if (d >= lightA.w) continue;
+    float ratio = d / lightA.w;
+    float cutoff = max(0.0, 1.0 - ratio * ratio * ratio * ratio);
+    float attenuation = (1.0 / (1.0 + 0.9 * d + 6.0 * d * d)) * cutoff * cutoff;
+    pointGlow += lightB.rgb * (lightB.a * uPointLightGlobal * attenuation);
+  }
+  float sunBeam = exp(-length((vWorld - uSun.xy) * vec2(uSun.w, 1.0)) * 3.2) * sunDayFactor();
+  vec3 dustColor = vec3(0.62, 0.52, 0.40) * (0.05 + accumulatedLuma * 1.35 + sunBeam * 0.55) + pointGlow * 0.85;
+  float alpha = disc * uPost2.z * mix(0.05, 0.30, vLayer) * clamp(0.25 + accumulatedLuma * 1.6 + luminance(pointGlow), 0.0, 1.6);
+  outColor = vec4(dustColor * alpha, alpha);
+}
+`;
+
+export const DEBRIS_VERTEX = /* glsl */ `#version 300 es
+precision highp float;
+layout(location = 0) in vec2 aPosition;
+layout(location = 1) in vec4 iParticle;     // world xy, size, life ratio
+layout(location = 2) in vec4 iParticleData; // kind, seed, -, -
+${GLOBALS}
+out vec2 vLocal;
+out float vLife;
+out float vKind;
+void main() {
+  vec2 local = aPosition - 0.5;
+  vec2 world = iParticle.xy + local * vec2(iParticle.z / max(uSun.w, 0.001), iParticle.z);
+  vLocal = local;
+  vLife = iParticle.w;
+  vKind = iParticleData.x;
+  gl_Position = vec4(world * 2.0 - 1.0, 0.0, 1.0);
+}
+`;
+
+export const DEBRIS_FRAGMENT = /* glsl */ `#version 300 es
+precision highp float;
+in vec2 vLocal;
+in float vLife;
+in float vKind;
+layout(location = 0) out vec4 outColor;
+void main() {
+  float disc = 1.0 - smoothstep(0.16, 0.5, length(vLocal));
+  if (disc <= 0.001) discard;
+  // kind 0 = poeira de impacto; kind 1 = marcador incandescente do corpo físico.
+  vec3 color = mix(vec3(0.48, 0.30, 0.17), vec3(1.0, 0.44, 0.13), vKind);
+  float brightness = mix(0.55, 2.4, vKind);
+  float alpha = disc * clamp(vLife, 0.0, 1.0) * mix(0.34, 0.9, vKind);
+  outColor = vec4(color * brightness * alpha, alpha);
+}
+`;
+
 export const COMPOSITE_FRAGMENT = /* glsl */ `#version 300 es
 precision highp float;
 in vec2 vUv;
@@ -604,6 +1041,9 @@ uniform sampler2D tColor;
 uniform sampler2D tAlbedo;
 uniform sampler2D tNormalMaterial;
 uniform sampler2D tDepth;
+uniform sampler2D tBloom;
+uniform sampler2D tGodRays;
+uniform sampler2D tAdapted;
 layout(location = 0) out vec4 outColor;
 
 vec3 decodeNormal(vec2 encoded) {
@@ -633,21 +1073,29 @@ void main() {
     float contour = 1.0 - smoothstep(0.0, 0.08, abs(fract(depth * 18.0) - 0.5));
     color += contour * 0.055;
   } else {
-    vec2 texel = 1.0 / max(uResolutionTime.xy * uQuality.z, vec2(1.0));
-    color = texture(tColor, vUv).rgb;
-    vec3 bloom = vec3(0.0);
-    bloom += max(texture(tColor, vUv + vec2(texel.x * 3.0, 0.0)).rgb - 0.7, 0.0);
-    bloom += max(texture(tColor, vUv - vec2(texel.x * 3.0, 0.0)).rgb - 0.7, 0.0);
-    bloom += max(texture(tColor, vUv + vec2(0.0, texel.y * 3.0)).rgb - 0.7, 0.0);
-    bloom += max(texture(tColor, vUv - vec2(0.0, texel.y * 3.0)).rgb - 0.7, 0.0);
-    color += bloom * uLighting.z * 0.25;
-    color = aces(color * uAtmosphere.w);
+    // --- Uber-post: CA → bloom Kawase + god rays → auto-exposição →
+    // ACES → gama → vinheta → grão. Tudo sobre o HDR acumulado.
+    vec2 centeredUv = vUv - 0.5;
+    float radiusSq = dot(centeredUv * vec2(uSun.w, 1.0), centeredUv * vec2(uSun.w, 1.0));
+    // Aberração cromática radial: offset = distortion · r²
+    vec2 caOffset = centeredUv * radiusSq * uPost.w * 0.012;
+    color.r = texture(tColor, vUv + caOffset).r;
+    color.g = texture(tColor, vUv).g;
+    color.b = texture(tColor, vUv - caOffset).b;
+    color += texture(tBloom, vUv).rgb * (uLighting.z * uPost2.w);
+    // A intensidade já está embutida na textura de god rays; o step só
+    // impede que uma textura antiga reapareça ao desligar o efeito.
+    color += texture(tGodRays, vUv).rgb * step(0.0001, uPost.z);
+    // Eye adaptation (1×1 ping-pong); desligada = fator neutro.
+    float adaptedExposure = texture(tAdapted, vec2(0.5)).r;
+    float exposureFactor = mix(1.0, adaptedExposure, uPost2.x);
+    color = aces(color * uAtmosphere.w * exposureFactor);
     color = pow(color, vec3(1.0 / 2.2));
-    vec2 centered = (vUv - 0.5) * vec2(0.82, 1.0);
-    float vignette = 1.0 - dot(centered, centered) * 0.52;
+    vec2 centered = centeredUv * vec2(0.82, 1.0);
+    float vignette = smoothstep(1.05, 0.32, length(centered * 1.65)) * 0.42 + 0.58;
     color *= vignette;
     float grain = hash12(gl_FragCoord.xy + mod(uResolutionTime.w, 16.0)) - 0.5;
-    color += grain * 0.011;
+    color += grain * 0.011 * (0.8 + 0.2 * sin(uResolutionTime.z * 7.0));
   }
   outColor = vec4(clamp(color, 0.0, 1.0), 1.0);
 }

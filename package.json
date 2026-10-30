@@ -7,6 +7,6 @@
   "scripts": {
     "dev": "node server.mjs",
     "start": "node server.mjs",
-    "check": "node --check src/main.js && node --check src/engine.js && node --check src/gl.js && node --check src/scene.js && node --check src/shaders.js && node --check server.mjs"
+    "check": "node --check src/main.js && node --check src/engine.js && node --check src/gl.js && node --check src/scene.js && node --check src/shaders.js && node --check src/spatial.js && node --check src/physics.js && node --check src/lights.js && node --check src/particles.js && node --check src/assets.js && node --check src/audio.js && node --check server.mjs"
   }
 }

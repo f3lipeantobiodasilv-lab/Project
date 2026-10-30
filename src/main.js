@@ -25,6 +25,12 @@ const sliderDefinitions = [
   { id: 'windSpeed', key: 'windSpeed', digits: 2 },
   { id: 'ssrIntensity', key: 'ssrIntensity', digits: 2 },
   { id: 'exposure', key: 'exposure', digits: 2 },
+  { id: 'bloomThreshold', key: 'bloomThreshold', digits: 2 },
+  { id: 'bloomIntensity', key: 'bloomIntensity', digits: 2 },
+  { id: 'godRayIntensity', key: 'godRayIntensity', digits: 2 },
+  { id: 'chromaticAberration', key: 'chromaticAberration', digits: 2 },
+  { id: 'pointLightIntensity', key: 'pointLightIntensity', digits: 2 },
+  { id: 'dustIntensity', key: 'dustIntensity', digits: 2 },
   { id: 'renderScale', key: 'renderScale', digits: 0 }
 ];
 const toggleDefinitions = [
@@ -32,7 +38,12 @@ const toggleDefinitions = [
   ['volumesEnabled', 'volumesEnabled'],
   ['cloudsEnabled', 'cloudsEnabled'],
   ['denoiseEnabled', 'denoiseEnabled'],
-  ['adaptiveEnabled', 'adaptiveEnabled']
+  ['adaptiveEnabled', 'adaptiveEnabled'],
+  ['bloomEnabled', 'bloomEnabled'],
+  ['godRaysEnabled', 'godRaysEnabled'],
+  ['autoExposureEnabled', 'autoExposureEnabled'],
+  ['pointLightsEnabled', 'pointLightsEnabled'],
+  ['dustEnabled', 'dustEnabled']
 ];
 
 function updateRangeFill(input) {
@@ -52,7 +63,7 @@ function updateSlider(definition) {
 
 function updateQualityLabel() {
   const settings = engine.settings;
-  qualitySummary.textContent = `${settings.fogSteps} ray steps · ${settings.cloudSteps} cloud slices · ${settings.ssrSteps} SSR steps`;
+  qualitySummary.textContent = `${settings.fogSteps} fog · ${settings.cloudSteps} clouds · ${settings.ssrSteps} SSR · ${settings.godRaySteps} god-ray · ${settings.dustCount} dust`;
 }
 
 function markQuality(name) {
@@ -74,6 +85,7 @@ function syncUI() {
   for (let i = 0; i < viewButtons.length; i++) {
     viewButtons[i].classList.toggle('active', Number(viewButtons[i].dataset.view) === engine.settings.debugView);
   }
+  byId('audioEnabled').checked = engine.settings.audioEnabled;
   byId('denoiseNode').classList.toggle('disabled', !engine.settings.denoiseEnabled);
   updateQualityLabel();
 }
@@ -150,6 +162,13 @@ const callbacks = {
     sunHint.style.left = `${x * 100}%`;
     sunHint.style.top = `${(1 - y) * 100}%`;
   },
+  onSpatialStats(stats, total) {
+    byId('instanceCount').textContent = `${stats.visible}/${total}`;
+    byId('instanceCount').title = `Spatial grid: ${stats.culled} fora da viewport · LOD ${stats.lod[0]}/${stats.lod[1]}/${stats.lod[2]}`;
+  },
+  onAudioChange(enabled) {
+    byId('audioEnabled').checked = enabled;
+  },
   onPauseChange(paused) {
     playButton.querySelector('use').setAttribute('href', paused ? '#i-play' : '#i-pause');
     playButton.setAttribute('aria-label', paused ? 'Retomar simulação' : 'Pausar simulação');
@@ -194,6 +213,10 @@ try {
       }
     });
   }
+
+  byId('audioEnabled').addEventListener('change', async (event) => {
+    await engine.setAudioEnabled(event.target.checked);
+  });
 
   for (let i = 0; i < qualityButtons.length; i++) {
     qualityButtons[i].addEventListener('click', () => {
@@ -241,6 +264,17 @@ try {
       setDebugView(Number(event.key) - 1);
     }
   });
+
+  // AssetManager em ação: pré-carrega as fontes dos shaders como assets
+  // de texto (os programas em uso vêm do import ES; o manager fica
+  // disponível em window.aether.assets para texturas/áudio futuros).
+  engine.assets.register('core-shaders', 'shader', './src/shaders.js');
+  engine.assets.onProgress((event) => {
+    if (event.error) byId('assetStatus').textContent = 'ASSETS · ERRO';
+    else if (event.done) byId('assetStatus').textContent = 'ASSETS · 100%';
+    else byId('assetStatus').textContent = `ASSETS · ${Math.round(event.fraction * 100)}%`;
+  });
+  void engine.assets.load('core-shaders').catch(() => {});
 
   syncUI();
   callbacks.onSunChange(engine.sunX, engine.sunY);

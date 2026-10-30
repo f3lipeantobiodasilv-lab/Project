@@ -37,6 +37,16 @@ export function setSampler(gl, program, name, unit) {
   }
 }
 
+// Resolve vários uniforms de uma vez (pós-processamento/luzes/partículas
+// têm parâmetros próprios fora do UBO compartilhado).
+export function uniformLocations(gl, program, names) {
+  const locations = {};
+  for (let i = 0; i < names.length; i++) {
+    locations[names[i]] = gl.getUniformLocation(program, names[i]);
+  }
+  return locations;
+}
+
 export class RenderTarget {
   constructor(gl, width, height, descriptors, label = 'RenderTarget') {
     this.gl = gl;
