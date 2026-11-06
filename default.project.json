@@ -1,0 +1,24 @@
+{
+  "name": "Hybrid Graphics Lab",
+  "tree": {
+    "$className": "DataModel",
+    "Workspace": {
+      "$className": "Workspace",
+      "$properties": { "Gravity": 196.2 },
+      "Sala de Teste de Graficos": { "$path": "src/Workspace/Sala.rbxmx" }
+    },
+    "Players": { "$className": "Players", "$properties": { "CharacterAutoLoads": true } },
+    "ReplicatedStorage": {
+      "$className": "ReplicatedStorage",
+      "GraphicsShared": { "$path": "src/ReplicatedStorage/GraphicsShared" }
+    },
+    "StarterGui": {
+      "$className": "StarterGui",
+      "HybridHUD": { "$className": "ScreenGui", "$properties": { "ResetOnSpawn": false, "IgnoreGuiInset": true } }
+    },
+    "StarterPlayer": {
+      "$className": "StarterPlayer",
+      "StarterPlayerScripts": { "$className": "StarterPlayerScripts", "$path": "src/StarterPlayer/StarterPlayerScripts" }
+    }
+  }
+}
